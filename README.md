@@ -1,5 +1,7 @@
 # rapidfire
 
+[![crates.io](https://img.shields.io/crates/v/rapidfire.svg)](https://crates.io/crates/rapidfire)
+[![docs.rs](https://docs.rs/rapidfire/badge.svg)](https://docs.rs/rapidfire)
 [![CI](https://github.com/alex09x/rapidfire/actions/workflows/ci.yml/badge.svg)](https://github.com/alex09x/rapidfire/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
@@ -361,7 +363,7 @@ already reported `Closed`; that value is dropped with the channel.
 
 ```toml
 [dependencies]
-rapidfire = { git = "https://github.com/alex09x/rapidfire" }
+rapidfire = "0.1"
 ```
 
 ```rust
