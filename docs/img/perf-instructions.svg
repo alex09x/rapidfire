@@ -1,0 +1,17 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 720 220' width='720' height='220' font-family='JetBrains Mono, SFMono-Regular, Menlo, monospace' font-size='13'>
+<rect width='720' height='220' fill='white'/>
+<text x='16' y='24' font-size='15' font-weight='bold' fill='#1f2328'>Why SPSC is faster: work per 2 M messages, Ryzen 9 7950X (perf stat)</text>
+<text x='16' y='42' fill='#6a737d'>millions; both queues miss L1d equally often (2.3 M); the gap is instruction count</text>
+<text x='240' y='72' text-anchor='end' fill='#1f2328' font-weight='bold'>rapidfire, instructions</text>
+<rect x='250' y='58' width='229.0' height='22' fill='#c0392b' rx='2'/>
+<text x='485.0' y='72' fill='#1f2328'>213</text>
+<text x='240' y='106' text-anchor='end' fill='#1f2328' font-weight='normal'>SegQueue, instructions</text>
+<rect x='250' y='92' width='400.0' height='22' fill='#8fa3b8' rx='2'/>
+<text x='656.0' y='106' fill='#1f2328'>372</text>
+<text x='240' y='140' text-anchor='end' fill='#1f2328' font-weight='bold'>rapidfire, cycles</text>
+<rect x='250' y='126' width='105.4' height='22' fill='#c0392b' rx='2'/>
+<text x='361.4' y='140' fill='#1f2328'>98</text>
+<text x='240' y='174' text-anchor='end' fill='#1f2328' font-weight='normal'>SegQueue, cycles</text>
+<rect x='250' y='160' width='234.4' height='22' fill='#8fa3b8' rx='2'/>
+<text x='490.4' y='174' fill='#1f2328'>218</text>
+</svg>

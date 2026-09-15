@@ -1,0 +1,23 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 720 288' width='720' height='288' font-family='JetBrains Mono, SFMono-Regular, Menlo, monospace' font-size='13'>
+<rect width='720' height='288' fill='white'/>
+<text x='16' y='24' font-size='15' font-weight='bold' fill='#1f2328'>One message through the channel, SPSC 1→1 unbounded, Ryzen 9 7950X</text>
+<text x='16' y='42' fill='#6a737d'>ns per message, lower is better</text>
+<text x='240' y='72' text-anchor='end' fill='#1f2328' font-weight='bold'>rapidfire</text>
+<rect x='250' y='58' width='20.4' height='22' fill='#c0392b' rx='2'/>
+<text x='276.4' y='72' fill='#1f2328'>5.4</text>
+<text x='240' y='106' text-anchor='end' fill='#1f2328' font-weight='normal'>crossbeam SegQueue</text>
+<rect x='250' y='92' width='54.7' height='22' fill='#8fa3b8' rx='2'/>
+<text x='310.7' y='106' fill='#1f2328'>14.5</text>
+<text x='240' y='140' text-anchor='end' fill='#1f2328' font-weight='normal'>std mpsc</text>
+<rect x='250' y='126' width='55.8' height='22' fill='#8fa3b8' rx='2'/>
+<text x='311.8' y='140' fill='#1f2328'>14.8</text>
+<text x='240' y='174' text-anchor='end' fill='#1f2328' font-weight='normal'>async-channel</text>
+<rect x='250' y='160' width='153.6' height='22' fill='#8fa3b8' rx='2'/>
+<text x='409.6' y='174' fill='#1f2328'>40.7</text>
+<text x='240' y='208' text-anchor='end' fill='#1f2328' font-weight='normal'>flume</text>
+<rect x='250' y='194' width='395.1' height='22' fill='#8fa3b8' rx='2'/>
+<text x='651.1' y='208' fill='#1f2328'>104.7</text>
+<text x='240' y='242' text-anchor='end' fill='#1f2328' font-weight='normal'>tokio mpsc</text>
+<rect x='250' y='228' width='400.0' height='22' fill='#8fa3b8' rx='2'/>
+<text x='656.0' y='242' fill='#1f2328'>106</text>
+</svg>
