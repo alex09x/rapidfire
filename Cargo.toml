@@ -1,0 +1,43 @@
+[package]
+name = "rapidfire"
+version = "0.1.0"
+edition = "2021"
+description = "Lock-free, zero-dependency async MPMC channel for Rust, built for latency-critical pipelines"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alex09x/rapidfire"
+readme = "README.md"
+keywords = ["channel", "async", "lock-free", "latency", "tokio"]
+categories = ["concurrency", "asynchronous"]
+
+[dependencies]
+# The channel itself depends on nothing but std.  `loom` is pulled in only by the
+# `loom` feature, for model checking: `cargo test --release --features loom --test loom`.
+loom = { version = "0.7", features = ["futures"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+async-channel = "2"
+flume = "0.11"
+futures = "0.3"
+# Compared against in the benches only; the crate itself has no deps.
+crossbeam-queue = "0.3"
+
+[features]
+loom = ["dep:loom"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fcrs_small_blocks)', 'cfg(fcrs_publish_asm)', 'cfg(fcrs_publish_fence)', 'cfg(fcrs_publish_rmw)', 'cfg(fcrs_mark_rmw)', 'cfg(fcrs_debug)'] }
+
+[[bench]]
+name = "channel_benchmarks"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 1
+
+[profile.bench]
+inherits = "release"
