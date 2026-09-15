@@ -327,8 +327,6 @@ alternative publish sequences were measured and rejected (`dmb ishst` + plain st
 `fence(Release)` + plain store, and an RMW publish); they remain behind `--cfg` switches.
 `perf` profiles on Zen 4 and Neoverse-N1 (in `RESULTS.md`) show the remaining time in the
 locked claim and in the slot-line transfers between cores, not in the generated code.
-`perf` profiles on Zen 4 and Neoverse-N1 (in `RESULTS.md`) show the remaining time in the
-locked claim and in the slot-line transfers between cores, not in the generated code.
 
 ## Verification
 

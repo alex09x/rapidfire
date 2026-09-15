@@ -1,0 +1,45 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 760 420' width='760' height='420' font-family='JetBrains Mono, SFMono-Regular, Menlo, monospace' font-size='12'>
+<defs><marker id='a' markerWidth='8' markerHeight='8' refX='7' refY='4' orient='auto'><path d='M0,0 L8,4 L0,8 z' fill='#1f2328'/></marker></defs>
+<rect width='760' height='420' fill='white'/>
+<text x='16' y='24' font-size='15' font-weight='bold' fill='#1f2328'>Queue layout: a linked list of 63-slot blocks, three cache lines of indices</text>
+<rect x='20' y='56' width='170' height='44' rx='6' fill='#f6f8fa' stroke='#1f2328' stroke-width='1.5'/><text x='105.0' y='76.0' text-anchor='middle' fill='#1f2328' font-weight='bold'>tail</text><text x='105.0' y='92.0' text-anchor='middle' fill='#6a737d' font-size='11'>producers: index, block</text>
+<rect x='20' y='126' width='170' height='44' rx='6' fill='#f6f8fa' stroke='#1f2328' stroke-width='1.5'/><text x='105.0' y='146.0' text-anchor='middle' fill='#1f2328' font-weight='bold'>head</text><text x='105.0' y='162.0' text-anchor='middle' fill='#6a737d' font-size='11'>consumers: index, block</text>
+<rect x='20' y='196' width='170' height='44' rx='6' fill='#f6f8fa' stroke='#1f2328' stroke-width='1.5'/><text x='105.0' y='216.0' text-anchor='middle' fill='#1f2328' font-weight='bold'>read marks</text><text x='105.0' y='232.0' text-anchor='middle' fill='#6a737d' font-size='11'>consumer-owned counters</text>
+<rect x='240' y='56' width='230' height='150' rx='6' fill='white' stroke='#1f2328' stroke-width='1.5'/>
+<text x='250' y='76' fill='#1f2328' font-weight='bold'>block 0</text>
+<text x='320' y='76' fill='#6a737d' font-size='11'>start = 0, in use</text>
+<rect x='250' y='88' width='26' height='26' fill='#fdecea' stroke='#1f2328'/>
+<rect x='280' y='88' width='26' height='26' fill='#fdecea' stroke='#1f2328'/>
+<rect x='310' y='88' width='26' height='26' fill='#fdecea' stroke='#1f2328'/>
+<rect x='340' y='88' width='26' height='26' fill='#fdecea' stroke='#1f2328'/>
+<rect x='370' y='88' width='26' height='26' fill='#fdecea' stroke='#1f2328'/>
+<rect x='400' y='88' width='26' height='26' fill='#fdecea' stroke='#1f2328'/>
+<rect x='430' y='88' width='26' height='26' fill='white' stroke='#1f2328'/>
+<text x='250' y='134' fill='#6a737d' font-size='11'>… 63 value slots, each with a</text>
+<text x='250' y='148' fill='#6a737d' font-size='11'>lap-tagged state word</text>
+<rect x='250' y='160' width='26' height='26' fill='#e6f0ff' stroke='#1f2328'/>
+<text x='284' y='172' fill='#6a737d' font-size='11'>slot 63 is the sentinel:</text>
+<text x='284' y='185' fill='#6a737d' font-size='11'>'the next block is installed'</text>
+<rect x='500' y='56' width='230' height='150' rx='6' fill='white' stroke='#1f2328' stroke-width='1.5'/>
+<text x='510' y='76' fill='#1f2328' font-weight='bold'>block 1</text>
+<text x='580' y='76' fill='#6a737d' font-size='11'>start = 64, spare</text>
+<rect x='510' y='88' width='26' height='26' fill='white' stroke='#1f2328'/>
+<rect x='540' y='88' width='26' height='26' fill='white' stroke='#1f2328'/>
+<rect x='570' y='88' width='26' height='26' fill='white' stroke='#1f2328'/>
+<rect x='600' y='88' width='26' height='26' fill='white' stroke='#1f2328'/>
+<rect x='630' y='88' width='26' height='26' fill='white' stroke='#1f2328'/>
+<rect x='660' y='88' width='26' height='26' fill='white' stroke='#1f2328'/>
+<rect x='690' y='88' width='26' height='26' fill='white' stroke='#1f2328'/>
+<text x='510' y='134' fill='#6a737d' font-size='11'>… 63 value slots, each with a</text>
+<text x='510' y='148' fill='#6a737d' font-size='11'>lap-tagged state word</text>
+<rect x='510' y='160' width='26' height='26' fill='#e6f0ff' stroke='#1f2328'/>
+<text x='544' y='172' fill='#6a737d' font-size='11'>slot 63 is the sentinel:</text>
+<text x='544' y='185' fill='#6a737d' font-size='11'>'the next block is installed'</text>
+<line x1='470' y1='130' x2='500' y2='130' stroke='#1f2328' stroke-width='1.5' marker-end='url(#a)'/>
+<line x1='190' y1='78' x2='240' y2='78' stroke='#1f2328' stroke-width='1.5' marker-end='url(#a)'/>
+<line x1='190' y1='148' x2='240' y2='148' stroke='#1f2328' stroke-width='1.5' marker-end='url(#a)'/>
+<text x='240' y='232' fill='#1f2328'>written slot</text><rect x='325' y='221' width='14' height='14' fill='#fdecea' stroke='#1f2328'/>
+<text x='360' y='232' fill='#1f2328'>empty slot</text><rect x='434' y='221' width='14' height='14' fill='white' stroke='#1f2328'/>
+<text x='470' y='232' fill='#1f2328'>sentinel</text><rect x='530' y='221' width='14' height='14' fill='#e6f0ff' stroke='#1f2328'/>
+<text x='20' y='268' fill='#6a737d' font-size='12'>Each index lives on its own 128-byte line, so a producer never touches the consumers' line on the</text><text x='20' y='285' fill='#6a737d' font-size='12'>fast path and vice versa. Producer: one fetch_add on the tail index (a CAS once contention has been</text><text x='20' y='302' fill='#6a737d' font-size='12'>seen), write the value, publish the slot state with a release store. Consumer: read the slot state</text><text x='20' y='319' fill='#6a737d' font-size='12'>first, then CAS the head index; it never claims a slot that is not written yet. Blocks are never</text><text x='20' y='336' fill='#6a737d' font-size='12'>freed while the queue is alive: a spare block and a small pool are recycled, so a slow walker never</text><text x='20' y='353' fill='#6a737d' font-size='12'>reads freed memory.</text>
+</svg>
