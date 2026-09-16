@@ -84,7 +84,7 @@ jobs:
         run: cargo test --release --bench raw_bench -- --nocapture | tee raw_bench.txt
         env:
           FCRS_RAW_BENCH_FULL: "1"
-          FCRS_RAW_BENCH_ARGS: "--json --pin=0,1,2,3"
+          FCRS_RAW_BENCH_ARGS: "--json"
           RUSTFLAGS: -C target-cpu=native
       - uses: actions/upload-artifact@v4
         with:
