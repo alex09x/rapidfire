@@ -20,6 +20,106 @@ fn model<F: Fn() + Sync + Send + 'static>(f: F) {
 }
 
 #[test]
+fn mpsc_single_receiver_unbounded_recycles() {
+    model(|| {
+        let (tx, mut rx) = rapidfire::mpsc::unbounded();
+        let sender = thread::spawn(move || {
+            for i in 0..5 {
+                tx.try_send(i).unwrap();
+            }
+        });
+        for i in 0..5 {
+            assert_eq!(block_on(rx.recv()), Ok(i));
+        }
+        sender.join().unwrap();
+        assert_eq!(block_on(rx.recv()), Err(RecvError));
+    });
+}
+
+#[test]
+fn mpsc_bounded_two_waiting_senders() {
+    // This three-actor model has a large state space. The default CI budget
+    // still reproduces the pre-fix deadlock; opt into the full bounded search
+    // with RAPIDFIRE_LOOM_EXTENDED=1. Other models have no permutation cap.
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(2);
+    if std::env::var_os("RAPIDFIRE_LOOM_EXTENDED").is_none() {
+        builder.max_permutations = Some(1_000_000);
+    }
+    builder.check(|| {
+        let (tx, mut rx) = rapidfire::mpsc::bounded(1);
+        tx.try_send(0).unwrap();
+        let tx2 = tx.clone();
+        let a = thread::spawn(move || block_on(tx.send(1)).unwrap());
+        let b = thread::spawn(move || block_on(tx2.send(2)).unwrap());
+        assert_eq!(block_on(rx.recv()), Ok(0));
+        let mut got = [block_on(rx.recv()).unwrap(), block_on(rx.recv()).unwrap()];
+        got.sort_unstable();
+        assert_eq!(got, [1, 2]);
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(block_on(rx.recv()), Err(RecvError));
+    });
+}
+
+#[test]
+fn general_bounded_two_waiting_senders() {
+    // This three-actor model has a large state space. The default CI budget
+    // still reproduces the pre-fix deadlock; opt into the full bounded search
+    // with RAPIDFIRE_LOOM_EXTENDED=1. Other models have no permutation cap.
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(2);
+    if std::env::var_os("RAPIDFIRE_LOOM_EXTENDED").is_none() {
+        builder.max_permutations = Some(1_000_000);
+    }
+    builder.check(|| {
+        let (tx, rx) = rapidfire::bounded(1);
+        tx.try_send(0).unwrap();
+        let tx2 = tx.clone();
+        let a = thread::spawn(move || block_on(tx.send(1)).unwrap());
+        let b = thread::spawn(move || block_on(tx2.send(2)).unwrap());
+        assert_eq!(block_on(rx.recv()), Ok(0));
+        let mut got = [block_on(rx.recv()).unwrap(), block_on(rx.recv()).unwrap()];
+        got.sort_unstable();
+        assert_eq!(got, [1, 2]);
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(block_on(rx.recv()), Err(RecvError));
+    });
+}
+
+#[test]
+fn mpsc_batch_wakes_sender_at_block_transition() {
+    model(|| {
+        let (tx, mut rx) = rapidfire::mpsc::bounded(3);
+        for i in 0..3 {
+            tx.try_send(i).unwrap();
+        }
+        let sender = thread::spawn(move || block_on(tx.send(3)).unwrap());
+        let mut got = Vec::new();
+        assert_eq!(block_on(rx.recv_many(&mut got, 3)), Ok(3));
+        assert_eq!(got, [0, 1, 2]);
+        assert_eq!(block_on(rx.recv()), Ok(3));
+        sender.join().unwrap();
+        assert_eq!(block_on(rx.recv()), Err(RecvError));
+    });
+}
+
+#[test]
+fn mpsc_recv_is_woken_by_send_or_close() {
+    model(|| {
+        let (tx, mut rx) = rapidfire::mpsc::unbounded();
+        let receiver = thread::spawn(move || {
+            assert_eq!(block_on(rx.recv()), Ok(7));
+            assert_eq!(block_on(rx.recv()), Err(RecvError));
+        });
+        tx.try_send(7).unwrap();
+        drop(tx);
+        receiver.join().unwrap();
+    });
+}
+
+#[test]
 fn two_producers_one_consumer_cross_block() {
     model(|| {
         let (tx, rx) = unbounded::<usize>();

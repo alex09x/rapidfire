@@ -1679,3 +1679,174 @@ fn test_futures_manual_poll_edge_cases() {
     assert_eq!(Pin::new(&mut r_parked).poll(&mut cx), Poll::Pending);
     drop(r_parked); // unregisters from list (pos is Some)
 }
+
+// A sender can publish its value and then be notified for a later free slot,
+// before its successful poll has removed the old waiter registration.
+#[test]
+fn completed_send_forwards_a_later_capacity_notification() {
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    type PendingSend = Pin<Box<dyn Future<Output = Result<(), SendError<u32>>> + Send>>;
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct ReparkThenDrain {
+        sender: Arc<Mutex<PendingSend>>,
+        sender_waker: Waker,
+        receiver: rapidfire::Receiver<u32>,
+    }
+    impl Wake for ReparkThenDrain {
+        fn wake(self: Arc<Self>) {
+            // B was woken by the first receive, but A has filled that slot.
+            assert!(self
+                .sender
+                .lock()
+                .unwrap()
+                .as_mut()
+                .poll(&mut Context::from_waker(&self.sender_waker))
+                .is_pending());
+            // A is still inside try_send, before unregistering its waiter. This
+            // receive notifies A even though B needs the newly available slot.
+            assert_eq!(self.receiver.try_recv(), Ok(1));
+        }
+    }
+
+    let (tx, rx) = bounded(1);
+    tx.try_send(0).unwrap();
+    let tx_b = tx.clone();
+    let b: PendingSend = Box::pin(async move { tx_b.send(2).await });
+    let b = Arc::new(Mutex::new(b));
+    let b_wakes = Arc::new(Count(AtomicUsize::new(0)));
+    let b_waker = Waker::from(b_wakes.clone());
+    assert!(b
+        .lock()
+        .unwrap()
+        .as_mut()
+        .poll(&mut Context::from_waker(&b_waker))
+        .is_pending());
+    let a_waker = Waker::from(Arc::new(Count(AtomicUsize::new(0))));
+    let mut a = Box::pin(tx.send(1));
+    assert!(a
+        .as_mut()
+        .poll(&mut Context::from_waker(&a_waker))
+        .is_pending());
+
+    assert_eq!(rx.try_recv(), Ok(0));
+    assert_eq!(b_wakes.0.load(Ordering::SeqCst), 1);
+    let drain = Waker::from(Arc::new(ReparkThenDrain {
+        sender: b.clone(),
+        sender_waker: b_waker.clone(),
+        receiver: rx.clone(),
+    }));
+    let mut receive = Box::pin(rx.recv());
+    assert!(receive
+        .as_mut()
+        .poll(&mut Context::from_waker(&drain))
+        .is_pending());
+    assert_eq!(
+        a.as_mut().poll(&mut Context::from_waker(&a_waker)),
+        Poll::Ready(Ok(()))
+    );
+    assert_eq!(
+        b_wakes.0.load(Ordering::SeqCst),
+        2,
+        "B must be notified for the second free slot"
+    );
+    drop(receive);
+    assert_eq!(
+        b.lock()
+            .unwrap()
+            .as_mut()
+            .poll(&mut Context::from_waker(&b_waker)),
+        Poll::Ready(Ok(()))
+    );
+    assert_eq!(rx.try_recv(), Ok(2));
+}
+
+#[test]
+fn completed_recv_forwards_a_later_message_notification() {
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    type PendingRecv = Pin<Box<dyn Future<Output = Result<u32, RecvError>> + Send>>;
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct ReparkThenSend {
+        receiver: Arc<Mutex<PendingRecv>>,
+        receiver_waker: Waker,
+        sender: rapidfire::Sender<u32>,
+    }
+    impl Wake for ReparkThenSend {
+        fn wake(self: Arc<Self>) {
+            // A has consumed the first message but has not returned from poll.
+            assert!(self
+                .receiver
+                .lock()
+                .unwrap()
+                .as_mut()
+                .poll(&mut Context::from_waker(&self.receiver_waker))
+                .is_pending());
+            // This message must notify B, even if A's old registration is still
+            // present while A is completing its previous receive.
+            self.sender.try_send(2).unwrap();
+        }
+    }
+    let (tx, rx) = bounded(1);
+    let rx_b = rx.clone();
+    let b: PendingRecv = Box::pin(async move { rx_b.recv().await });
+    let b = Arc::new(Mutex::new(b));
+    let b_wakes = Arc::new(Count(AtomicUsize::new(0)));
+    let b_waker = Waker::from(b_wakes.clone());
+    assert!(b
+        .lock()
+        .unwrap()
+        .as_mut()
+        .poll(&mut Context::from_waker(&b_waker))
+        .is_pending());
+    let a_waker = Waker::from(Arc::new(Count(AtomicUsize::new(0))));
+    let mut a = Box::pin(rx.recv());
+    assert!(a
+        .as_mut()
+        .poll(&mut Context::from_waker(&a_waker))
+        .is_pending());
+    tx.try_send(0).unwrap();
+    assert_eq!(b_wakes.0.load(Ordering::SeqCst), 1);
+
+    let refill = Waker::from(Arc::new(ReparkThenSend {
+        receiver: b.clone(),
+        receiver_waker: b_waker.clone(),
+        sender: tx.clone(),
+    }));
+    let mut send = Box::pin(tx.send(1));
+    assert!(send
+        .as_mut()
+        .poll(&mut Context::from_waker(&refill))
+        .is_pending());
+    assert_eq!(
+        a.as_mut().poll(&mut Context::from_waker(&a_waker)),
+        Poll::Ready(Ok(0))
+    );
+    assert_eq!(
+        b_wakes.0.load(Ordering::SeqCst),
+        2,
+        "B must be notified for the second message"
+    );
+    drop(send);
+    assert_eq!(
+        b.lock()
+            .unwrap()
+            .as_mut()
+            .poll(&mut Context::from_waker(&b_waker)),
+        Poll::Ready(Ok(2))
+    );
+}
