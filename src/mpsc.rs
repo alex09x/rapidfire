@@ -4,9 +4,35 @@
 //! the queue to omit arbitration and completion flags between consumers. Senders
 //! have the same API as the general channel. Memory retention and close-race
 //! semantics are the same as the general channel.
+//!
+//! ```
+//! # tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+//! let (tx, mut rx) = rapidfire::mpsc::bounded(256);
+//! tx.send(7).await.unwrap();
+//! tx.send(8).await.unwrap();
+//! let mut batch = Vec::with_capacity(32);
+//! assert_eq!(rx.recv_many(&mut batch, 32).await.unwrap(), 2);
+//! assert_eq!(batch, [7, 8]);
+//! # });
+//! ```
+//!
+//! Receivers cannot be cloned or polled concurrently:
+//!
+//! ```compile_fail
+//! let (_, rx) = rapidfire::mpsc::unbounded::<u64>();
+//! let second = rx.clone();
+//! ```
+//!
+//! ```compile_fail
+//! let (_, mut rx) = rapidfire::mpsc::unbounded::<u64>();
+//! let first = rx.recv();
+//! let second = rx.recv();
+//! drop((first, second));
+//! ```
 
 use crate::queue::Backoff;
-use crate::{RecvError, RecvState, Sender, TryRecvError};
+pub use crate::Sender;
+use crate::{RecvError, RecvState, TryRecvError};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -258,5 +284,36 @@ mod tests {
             drop(tx);
             assert_eq!(rx.recv_many(&mut got, 10).await, Err(RecvError));
         });
+    }
+
+    #[test]
+    fn batch_recycling_and_channel_drop_destroy_each_value_once() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct Item(Arc<AtomicUsize>);
+        impl Drop for Item {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = unbounded();
+        for _ in 0..133 {
+            tx.try_send(Item(drops.clone())).unwrap();
+        }
+        let mut batch = Vec::with_capacity(32);
+        for _ in 0..4 {
+            assert_eq!(
+                futures::executor::block_on(rx.recv_many(&mut batch, 32)),
+                Ok(32)
+            );
+            batch.clear();
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 128);
+        drop(rx);
+        drop(tx);
+        assert_eq!(drops.load(Ordering::Relaxed), 133);
     }
 }

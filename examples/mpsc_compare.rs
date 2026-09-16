@@ -304,10 +304,127 @@ fn main() {
         .split(',')
         .collect();
     let bytes: usize = args.get(5).map_or(64, |s| s.parse().unwrap());
+    if modes == ["latency"] {
+        latency_matrix(n, runs, &ps);
+        return;
+    }
     match bytes {
         64 => run::<48>(n, runs, &ps, &modes),
         256 => run::<240>(n, runs, &ps, &modes),
         1024 => run::<1008>(n, runs, &ps, &modes),
         _ => panic!("payload must be 64/256/1024"),
+    }
+}
+
+// A separate paced workload. Latency is timestamp-before-send to consumer
+// inspection, including capacity waits, runtime scheduling and measurement cost.
+// Each producer offers bursts of 16 values at 1 ms intervals; it does not wait
+// for a response. This is not a throughput measurement or a network benchmark.
+fn latency_run<R: Receive<Msg<48>> + 'static>(
+    tx: Sender<Msg<48>>,
+    mut rx: R,
+    producers: usize,
+    n: usize,
+    batch: usize,
+) -> [u64; 3] {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let worker = AtomicUsize::new(0);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_time()
+        .on_thread_start(move || pin(worker.fetch_add(1, Ordering::Relaxed)))
+        .build()
+        .unwrap();
+    let each = n.div_ceil(producers);
+    let actual = each * producers;
+    runtime.block_on(async move {
+        let start = Arc::new(tokio::sync::Barrier::new(producers + 1));
+        let epoch = Instant::now();
+        let mut handles = Vec::new();
+        for p in 0..producers {
+            let tx = tx.clone();
+            let start = start.clone();
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                let mut timer = tokio::time::interval(std::time::Duration::from_millis(1));
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                for i in 0..each {
+                    if i % 16 == 0 {
+                        timer.tick().await;
+                    }
+                    let mut msg = Msg::new(p * each + i);
+                    msg.stamp = epoch.elapsed().as_nanos() as u64;
+                    tx.send(msg).await.unwrap();
+                }
+            }));
+        }
+        drop(tx);
+        let consumer = tokio::spawn(async move {
+            let mut delays = Vec::with_capacity(actual);
+            let mut buffer = Vec::with_capacity(batch);
+            let mut sum = 0;
+            start.wait().await;
+            while delays.len() < actual {
+                if batch == 1 {
+                    buffer.push(rx.recv().await.unwrap());
+                } else {
+                    rx.many(&mut buffer, batch.min(actual - delays.len()))
+                        .await
+                        .unwrap();
+                }
+                for msg in buffer.drain(..) {
+                    delays.push((epoch.elapsed().as_nanos() as u64).saturating_sub(msg.stamp));
+                    sum += black_box(msg).seq;
+                }
+            }
+            assert_eq!(sum, (actual as u64) * (actual as u64 - 1) / 2);
+            delays.sort_unstable();
+            [
+                delays[actual / 2],
+                delays[(actual - 1) * 99 / 100],
+                delays[actual - 1],
+            ]
+        });
+        for h in handles {
+            h.await.unwrap();
+        }
+        consumer.await.unwrap()
+    })
+}
+
+fn latency_matrix(n: usize, runs: usize, ps: &[usize]) {
+    for &p in ps {
+        for capacity in [0, 25, 4096] {
+            for batch in [1, 32] {
+                let mut results = [Vec::new(), Vec::new()];
+                for round in 0..runs + 1 {
+                    for order in 0..2 {
+                        let variant = (round + order) % 2;
+                        let values = if variant == 0 {
+                            let (tx, rx) = if capacity == 0 {
+                                rapidfire::unbounded()
+                            } else {
+                                rapidfire::bounded(capacity)
+                            };
+                            latency_run(tx, rx, p, n, batch)
+                        } else {
+                            let (tx, rx) = if capacity == 0 {
+                                mpsc::unbounded()
+                            } else {
+                                mpsc::bounded(capacity)
+                            };
+                            latency_run(tx, rx, p, n, batch)
+                        };
+                        if round > 0 {
+                            results[variant].push(values);
+                        }
+                    }
+                }
+                for (variant, samples) in results.iter().enumerate() {
+                    println!("{{\"variant\":\"{}\",\"mode\":\"latency\",\"producers\":{},\"capacity\":{},\"bytes\":64,\"batch\":{},\"samples_p50_p99_max_ns\":{:?}}}",
+                if variant == 0 { "mpmc" } else { "mpsc" }, p, capacity, batch, samples);
+                }
+            }
+        }
     }
 }
