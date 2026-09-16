@@ -415,16 +415,20 @@ fn sync_pipeline<T: Payload, C: Chan<T>>(
     let per = (ctx.cfg.n / producers).max(1);
     let total = per * producers;
     let (tx, mut rx) = C::channel(cap);
-    let barrier = Arc::new(Barrier::new(producers + 2));
+    // Wait until workers are ready, then time the start gate and full workload.
+    let ready = Arc::new(Barrier::new(producers + 2));
+    let start_gate = Arc::new(Barrier::new(producers + 2));
 
     let mut prod_handles = Vec::with_capacity(producers);
     for p in 0..producers {
         let tx_c = tx.clone();
-        let b = barrier.clone();
+        let ready_p = ready.clone();
+        let start_p = start_gate.clone();
         let pin: Vec<usize> = ctx.cfg.pin.clone();
         prod_handles.push(thread::spawn(move || {
             pin_worker(&pin, p);
-            b.wait();
+            ready_p.wait();
+            start_p.wait();
             let base = (p * per) as u64;
             for j in 0..per as u64 {
                 send_spin::<T, C>(&tx_c, T::new(base + j));
@@ -432,11 +436,13 @@ fn sync_pipeline<T: Payload, C: Chan<T>>(
         }));
     }
 
-    let b = barrier.clone();
+    let ready_c = ready.clone();
+    let start_c = start_gate.clone();
     let pin: Vec<usize> = ctx.cfg.pin.clone();
     let consumer = thread::spawn(move || {
         pin_worker(&pin, producers);
-        b.wait();
+        ready_c.wait();
+        start_c.wait();
         let mut sum = 0u64;
         for _ in 0..total {
             sum = sum.wrapping_add(recv_spin::<T, C>(&mut rx).seq());
@@ -444,8 +450,9 @@ fn sync_pipeline<T: Payload, C: Chan<T>>(
         sum
     });
 
-    barrier.wait();
+    ready.wait();
     let start = Instant::now();
+    start_gate.wait();
     let sum = consumer.join().expect("consumer thread panicked");
     let elapsed = start.elapsed().as_nanos() as f64;
     for h in prod_handles {
@@ -471,14 +478,18 @@ fn async_pipeline<T: Payload, C: Chan<T>>(
 
     ctx.rt.block_on(async move {
         let (tx, mut rx) = C::channel(cap);
-        let barrier = Arc::new(tokio::sync::Barrier::new(producers + 2));
+        // Wait until workers are ready, then time the start gate and full workload.
+        let ready = Arc::new(tokio::sync::Barrier::new(producers + 2));
+        let start_gate = Arc::new(tokio::sync::Barrier::new(producers + 2));
 
         let mut prod_handles = Vec::with_capacity(producers);
         for p in 0..producers {
             let tx_c = tx.clone();
-            let b = barrier.clone();
+            let ready_p = ready.clone();
+            let start_p = start_gate.clone();
             prod_handles.push(tokio::spawn(async move {
-                b.wait().await;
+                ready_p.wait().await;
+                start_p.wait().await;
                 let base = (p * per) as u64;
                 for j in 0..per as u64 {
                     C::send_async(&tx_c, T::new(base + j)).await;
@@ -486,9 +497,11 @@ fn async_pipeline<T: Payload, C: Chan<T>>(
             }));
         }
 
-        let b = barrier.clone();
+        let ready_c = ready.clone();
+        let start_c = start_gate.clone();
         let consumer = tokio::spawn(async move {
-            b.wait().await;
+            ready_c.wait().await;
+            start_c.wait().await;
             let mut sum = 0u64;
             for _ in 0..total {
                 match C::recv_async(&mut rx).await {
@@ -499,8 +512,9 @@ fn async_pipeline<T: Payload, C: Chan<T>>(
             sum
         });
 
-        barrier.wait().await;
+        ready.wait().await;
         let start = Instant::now();
+        start_gate.wait().await;
         let sum = consumer.await.expect("consumer task panicked");
         let elapsed = start.elapsed().as_nanos() as f64;
         for h in prod_handles {
@@ -520,24 +534,30 @@ fn sync_request_response<T: Payload, C: Chan<T>>(ctx: &Ctx<'_>) -> Sample {
     let rounds = (ctx.cfg.n / ROUNDTRIP_DIV).max(1);
     let (tx_req, mut rx_req) = C::channel(Some(CAP_BOT));
     let (tx_rsp, mut rx_rsp) = C::channel(Some(CAP_BOT));
-    let barrier = Arc::new(Barrier::new(3));
+    // Wait until workers are ready, then time the start gate and full workload.
+    let ready = Arc::new(Barrier::new(3));
+    let start_gate = Arc::new(Barrier::new(3));
 
-    let b = barrier.clone();
+    let ready_e = ready.clone();
+    let start_e = start_gate.clone();
     let pin: Vec<usize> = ctx.cfg.pin.clone();
     let executor = thread::spawn(move || {
         pin_worker(&pin, 1);
-        b.wait();
+        ready_e.wait();
+        start_e.wait();
         for _ in 0..rounds {
             let v = recv_spin::<T, C>(&mut rx_req);
             send_spin::<T, C>(&tx_rsp, v);
         }
     });
 
-    let b = barrier.clone();
+    let ready_b = ready.clone();
+    let start_b = start_gate.clone();
     let pin: Vec<usize> = ctx.cfg.pin.clone();
     let bot = thread::spawn(move || {
         pin_worker(&pin, 0);
-        b.wait();
+        ready_b.wait();
+        start_b.wait();
         let mut sum = 0u64;
         for i in 0..rounds as u64 {
             send_spin::<T, C>(&tx_req, T::new(i));
@@ -546,8 +566,9 @@ fn sync_request_response<T: Payload, C: Chan<T>>(ctx: &Ctx<'_>) -> Sample {
         sum
     });
 
-    barrier.wait();
+    ready.wait();
     let start = Instant::now();
+    start_gate.wait();
     let sum = bot.join().expect("bot thread panicked");
     let elapsed = start.elapsed().as_nanos() as f64;
     executor.join().expect("executor thread panicked");
@@ -565,11 +586,15 @@ fn async_request_response<T: Payload, C: Chan<T>>(ctx: &Ctx<'_>) -> Sample {
     ctx.rt.block_on(async move {
         let (tx_req, mut rx_req) = C::channel(Some(CAP_BOT));
         let (tx_rsp, mut rx_rsp) = C::channel(Some(CAP_BOT));
-        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        // Wait until workers are ready, then time the start gate and full workload.
+        let ready = Arc::new(tokio::sync::Barrier::new(3));
+        let start_gate = Arc::new(tokio::sync::Barrier::new(3));
 
-        let b = barrier.clone();
+        let ready_e = ready.clone();
+        let start_e = start_gate.clone();
         let executor = tokio::spawn(async move {
-            b.wait().await;
+            ready_e.wait().await;
+            start_e.wait().await;
             for _ in 0..rounds {
                 match C::recv_async(&mut rx_req).await {
                     Some(v) => C::send_async(&tx_rsp, v).await,
@@ -578,9 +603,11 @@ fn async_request_response<T: Payload, C: Chan<T>>(ctx: &Ctx<'_>) -> Sample {
             }
         });
 
-        let b = barrier.clone();
+        let ready_b = ready.clone();
+        let start_b = start_gate.clone();
         let bot = tokio::spawn(async move {
-            b.wait().await;
+            ready_b.wait().await;
+            start_b.wait().await;
             let mut sum = 0u64;
             for i in 0..rounds as u64 {
                 C::send_async(&tx_req, T::new(i)).await;
@@ -592,8 +619,9 @@ fn async_request_response<T: Payload, C: Chan<T>>(ctx: &Ctx<'_>) -> Sample {
             sum
         });
 
-        barrier.wait().await;
+        ready.wait().await;
         let start = Instant::now();
+        start_gate.wait().await;
         let sum = bot.await.expect("bot task panicked");
         let elapsed = start.elapsed().as_nanos() as f64;
         executor.await.expect("executor task panicked");

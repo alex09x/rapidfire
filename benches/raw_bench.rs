@@ -21,7 +21,6 @@
 
 use crossbeam_queue::{ArrayQueue, SegQueue};
 use std::hint::spin_loop;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
@@ -103,7 +102,7 @@ trait Chan: 'static {
     fn clone_rx(rx: &Self::Rx) -> Option<Self::Rx>;
     /// `Err` means full or closed; the caller spins.
     fn try_send(tx: &Self::Tx, v: u64) -> Result<(), u64>;
-    fn try_recv(rx: &Self::Rx) -> Option<u64>;
+    fn try_recv(rx: &mut Self::Rx) -> Option<u64>;
 }
 
 // ---------------------------------------------------------------- rapidfire
@@ -132,7 +131,7 @@ impl Chan for Fast {
     fn try_send(tx: &Self::Tx, v: u64) -> Result<(), u64> {
         tx.try_send(v).map_err(|e| e.into_inner())
     }
-    fn try_recv(rx: &Self::Rx) -> Option<u64> {
+    fn try_recv(rx: &mut Self::Rx) -> Option<u64> {
         rx.try_recv().ok()
     }
 }
@@ -165,7 +164,7 @@ impl Chan for CrossbeamSeg {
         tx.push(v);
         Ok(())
     }
-    fn try_recv(rx: &Self::Rx) -> Option<u64> {
+    fn try_recv(rx: &mut Self::Rx) -> Option<u64> {
         rx.pop()
     }
 }
@@ -197,7 +196,7 @@ impl Chan for CrossbeamArray {
     fn try_send(tx: &Self::Tx, v: u64) -> Result<(), u64> {
         tx.push(v)
     }
-    fn try_recv(rx: &Self::Rx) -> Option<u64> {
+    fn try_recv(rx: &mut Self::Rx) -> Option<u64> {
         rx.pop()
     }
 }
@@ -229,7 +228,7 @@ impl Chan for StdMpsc {
     fn try_send(tx: &Self::Tx, v: u64) -> Result<(), u64> {
         tx.send(v).map_err(|e| e.0)
     }
-    fn try_recv(rx: &Self::Rx) -> Option<u64> {
+    fn try_recv(rx: &mut Self::Rx) -> Option<u64> {
         rx.try_recv().ok()
     }
 }
@@ -260,7 +259,7 @@ impl Chan for Flume {
     fn try_send(tx: &Self::Tx, v: u64) -> Result<(), u64> {
         tx.try_send(v).map_err(|e| e.into_inner())
     }
-    fn try_recv(rx: &Self::Rx) -> Option<u64> {
+    fn try_recv(rx: &mut Self::Rx) -> Option<u64> {
         rx.try_recv().ok()
     }
 }
@@ -291,7 +290,7 @@ impl Chan for AsyncChannel {
     fn try_send(tx: &Self::Tx, v: u64) -> Result<(), u64> {
         tx.try_send(v).map_err(|e| e.into_inner())
     }
-    fn try_recv(rx: &Self::Rx) -> Option<u64> {
+    fn try_recv(rx: &mut Self::Rx) -> Option<u64> {
         rx.try_recv().ok()
     }
 }
@@ -303,14 +302,10 @@ enum TokioTx {
     Bounded(tokio::sync::mpsc::Sender<u64>),
 }
 
-enum TokioRxInner {
+enum TokioRx {
     Unbounded(tokio::sync::mpsc::UnboundedReceiver<u64>),
     Bounded(tokio::sync::mpsc::Receiver<u64>),
 }
-
-/// `tokio`'s receivers need `&mut self`, so the shared handle carries a mutex.
-/// It is always uncontended here because `MULTI_CONSUMER` is `false`.
-struct TokioRx(std::sync::Mutex<TokioRxInner>);
 
 struct TokioMpsc;
 
@@ -323,17 +318,11 @@ impl Chan for TokioMpsc {
 
     fn unbounded() -> Option<(Self::Tx, Self::Rx)> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        Some((
-            TokioTx::Unbounded(tx),
-            TokioRx(std::sync::Mutex::new(TokioRxInner::Unbounded(rx))),
-        ))
+        Some((TokioTx::Unbounded(tx), TokioRx::Unbounded(rx)))
     }
     fn bounded(cap: usize) -> Option<(Self::Tx, Self::Rx)> {
         let (tx, rx) = tokio::sync::mpsc::channel(cap);
-        Some((
-            TokioTx::Bounded(tx),
-            TokioRx(std::sync::Mutex::new(TokioRxInner::Bounded(rx))),
-        ))
+        Some((TokioTx::Bounded(tx), TokioRx::Bounded(rx)))
     }
     fn clone_tx(tx: &Self::Tx) -> Self::Tx {
         match tx {
@@ -351,11 +340,10 @@ impl Chan for TokioMpsc {
             TokioTx::Bounded(t) => t.try_send(v).map_err(|e| e.into_inner()),
         }
     }
-    fn try_recv(rx: &Self::Rx) -> Option<u64> {
-        let mut guard = rx.0.lock().unwrap();
-        match &mut *guard {
-            TokioRxInner::Unbounded(r) => r.try_recv().ok(),
-            TokioRxInner::Bounded(r) => r.try_recv().ok(),
+    fn try_recv(rx: &mut Self::Rx) -> Option<u64> {
+        match rx {
+            TokioRx::Unbounded(r) => r.try_recv().ok(),
+            TokioRx::Bounded(r) => r.try_recv().ok(),
         }
     }
 }
@@ -381,7 +369,7 @@ fn check_sum(got: u64, want: u64) {
 }
 
 /// Spins until an item is available.
-fn recv_spin<C: Chan>(rx: &C::Rx) -> u64 {
+fn recv_spin<C: Chan>(rx: &mut C::Rx) -> u64 {
     loop {
         if let Some(v) = C::try_recv(rx) {
             return v;
@@ -408,12 +396,12 @@ fn ns_per_op(elapsed_ns: f64, ops: usize) -> Option<f64> {
 // ============================================================================
 
 fn sc_st_push_pop<C: Chan>(n: usize, _pin: &[usize]) -> Option<f64> {
-    let (tx, rx) = C::unbounded()?;
+    let (tx, mut rx) = C::unbounded()?;
     let mut sum = 0u64;
     let start = Instant::now();
     for i in 0..n as u64 {
         send_spin::<C>(&tx, i);
-        sum += recv_spin::<C>(&rx);
+        sum += recv_spin::<C>(&mut rx);
     }
     let elapsed = start.elapsed().as_nanos() as f64;
     check_sum(sum, expected_sum(n as u64));
@@ -422,7 +410,7 @@ fn sc_st_push_pop<C: Chan>(n: usize, _pin: &[usize]) -> Option<f64> {
 
 fn sc_st_burst_1k<C: Chan>(n: usize, _pin: &[usize]) -> Option<f64> {
     const BURST: usize = 1000;
-    let (tx, rx) = C::unbounded()?;
+    let (tx, mut rx) = C::unbounded()?;
     let bursts = (n / BURST).max(1);
     let total = bursts * BURST;
     let mut next = 0u64;
@@ -434,7 +422,7 @@ fn sc_st_burst_1k<C: Chan>(n: usize, _pin: &[usize]) -> Option<f64> {
             next += 1;
         }
         for _ in 0..BURST {
-            sum += recv_spin::<C>(&rx);
+            sum += recv_spin::<C>(&mut rx);
         }
     }
     let elapsed = start.elapsed().as_nanos() as f64;
@@ -443,36 +431,43 @@ fn sc_st_burst_1k<C: Chan>(n: usize, _pin: &[usize]) -> Option<f64> {
 }
 
 fn spsc_inner<C: Chan>(n: usize, pin: &[usize], cap: Option<usize>) -> Option<f64> {
-    let (tx, rx) = match cap {
+    let (tx, mut rx) = match cap {
         Some(c) => C::bounded(c)?,
         None => C::unbounded()?,
     };
-    let barrier = Arc::new(Barrier::new(3));
+    // Wait until workers are ready, then time the start gate and full workload.
+    let ready = Arc::new(Barrier::new(3));
+    let start_gate = Arc::new(Barrier::new(3));
 
-    let b = barrier.clone();
+    let ready_p = ready.clone();
+    let start_p = start_gate.clone();
     let pin_p: Vec<usize> = pin.to_vec();
     let producer = thread::spawn(move || {
         pin_worker(&pin_p, 0);
-        b.wait();
+        ready_p.wait();
+        start_p.wait();
         for i in 0..n as u64 {
             send_spin::<C>(&tx, i);
         }
     });
 
-    let b = barrier.clone();
+    let ready_c = ready.clone();
+    let start_c = start_gate.clone();
     let pin_c: Vec<usize> = pin.to_vec();
     let consumer = thread::spawn(move || {
         pin_worker(&pin_c, 1);
-        b.wait();
+        ready_c.wait();
+        start_c.wait();
         let mut sum = 0u64;
         for _ in 0..n {
-            sum += recv_spin::<C>(&rx);
+            sum += recv_spin::<C>(&mut rx);
         }
         sum
     });
 
-    barrier.wait();
+    ready.wait();
     let start = Instant::now();
+    start_gate.wait();
     let sum = consumer.join().expect("consumer thread panicked");
     let elapsed = start.elapsed().as_nanos() as f64;
     producer.join().expect("producer thread panicked");
@@ -494,22 +489,26 @@ fn mpsc_inner<C: Chan>(
     producers: usize,
     cap: Option<usize>,
 ) -> Option<f64> {
-    let (tx, rx) = match cap {
+    let (tx, mut rx) = match cap {
         None => C::unbounded()?,
         Some(c) => C::bounded(c)?,
     };
     let per = (n / producers).max(1);
     let total = per * producers;
-    let barrier = Arc::new(Barrier::new(producers + 2));
+    // Wait until workers are ready, then time the start gate and full workload.
+    let ready = Arc::new(Barrier::new(producers + 2));
+    let start_gate = Arc::new(Barrier::new(producers + 2));
 
     let mut prod_handles = Vec::with_capacity(producers);
     for p in 0..producers {
         let tx_c = C::clone_tx(&tx);
-        let b = barrier.clone();
+        let ready_p = ready.clone();
+        let start_p = start_gate.clone();
         let pin_p: Vec<usize> = pin.to_vec();
         prod_handles.push(thread::spawn(move || {
             pin_worker(&pin_p, p);
-            b.wait();
+            ready_p.wait();
+            start_p.wait();
             let base = (p * per) as u64;
             for j in 0..per as u64 {
                 send_spin::<C>(&tx_c, base + j);
@@ -517,20 +516,23 @@ fn mpsc_inner<C: Chan>(
         }));
     }
 
-    let b = barrier.clone();
+    let ready_c = ready.clone();
+    let start_c = start_gate.clone();
     let pin_c: Vec<usize> = pin.to_vec();
     let consumer = thread::spawn(move || {
         pin_worker(&pin_c, producers);
-        b.wait();
+        ready_c.wait();
+        start_c.wait();
         let mut sum = 0u64;
         for _ in 0..total {
-            sum += recv_spin::<C>(&rx);
+            sum += recv_spin::<C>(&mut rx);
         }
         sum
     });
 
-    barrier.wait();
+    ready.wait();
     let start = Instant::now();
+    start_gate.wait();
     let sum = consumer.join().expect("consumer thread panicked");
     let elapsed = start.elapsed().as_nanos() as f64;
     for h in prod_handles {
@@ -590,20 +592,31 @@ fn mpmc_inner<C: Chan>(n: usize, pin: &[usize], cap: Option<usize>) -> Option<f6
     for _ in 0..CONSUMERS {
         rxs.push(C::clone_rx(&rx)?);
     }
+    drop(rx);
 
     let per = (n / PRODUCERS).max(1);
     let total = per * PRODUCERS;
-    let received = Arc::new(AtomicUsize::new(0));
-    let barrier = Arc::new(Barrier::new(PRODUCERS + CONSUMERS + 1));
+
+    // Local completion accounting: each consumer has a fixed quota summing to the exact total.
+    // Handles totals not divisible by CONSUMERS by giving +1 to the first remainder consumers.
+    // No shared AtomicUsize RMW is performed per message.
+    let base_quota = total / CONSUMERS;
+    let rem = total % CONSUMERS;
+
+    // Wait until workers are ready, then time the start gate and full workload.
+    let ready = Arc::new(Barrier::new(PRODUCERS + CONSUMERS + 1));
+    let start_gate = Arc::new(Barrier::new(PRODUCERS + CONSUMERS + 1));
 
     let mut prod_handles = Vec::with_capacity(PRODUCERS);
     for p in 0..PRODUCERS {
         let tx_c = C::clone_tx(&tx);
-        let b = barrier.clone();
+        let ready_p = ready.clone();
+        let start_p = start_gate.clone();
         let pin_p: Vec<usize> = pin.to_vec();
         prod_handles.push(thread::spawn(move || {
             pin_worker(&pin_p, p);
-            b.wait();
+            ready_p.wait();
+            start_p.wait();
             let base = (p * per) as u64;
             for j in 0..per as u64 {
                 send_spin::<C>(&tx_c, base + j);
@@ -612,33 +625,26 @@ fn mpmc_inner<C: Chan>(n: usize, pin: &[usize], cap: Option<usize>) -> Option<f6
     }
 
     let mut cons_handles = Vec::with_capacity(CONSUMERS);
-    for (k, rx_c) in rxs.into_iter().enumerate() {
-        let b = barrier.clone();
-        let counter = received.clone();
+    for (k, mut rx_c) in rxs.into_iter().enumerate() {
+        let ready_c = ready.clone();
+        let start_c = start_gate.clone();
         let pin_c: Vec<usize> = pin.to_vec();
+        let my_quota = base_quota + if k < rem { 1 } else { 0 };
         cons_handles.push(thread::spawn(move || {
             pin_worker(&pin_c, PRODUCERS + k);
-            b.wait();
+            ready_c.wait();
+            start_c.wait();
             let mut sum = 0u64;
-            loop {
-                if let Some(v) = C::try_recv(&rx_c) {
-                    sum += v;
-                    if counter.fetch_add(1, Ordering::Relaxed) + 1 >= total {
-                        break;
-                    }
-                } else {
-                    if counter.load(Ordering::Relaxed) >= total {
-                        break;
-                    }
-                    spin_loop();
-                }
+            for _ in 0..my_quota {
+                sum += recv_spin::<C>(&mut rx_c);
             }
             sum
         }));
     }
 
-    barrier.wait();
+    ready.wait();
     let start = Instant::now();
+    start_gate.wait();
     let mut sum = 0u64;
     for h in cons_handles {
         sum += h.join().expect("consumer thread panicked");
@@ -653,36 +659,43 @@ fn mpmc_inner<C: Chan>(n: usize, pin: &[usize], cap: Option<usize>) -> Option<f6
 
 fn sc_pingpong<C: Chan>(n: usize, pin: &[usize]) -> Option<f64> {
     let rounds = (n / 20).max(1);
-    let (tx_a, rx_a) = C::unbounded()?;
-    let (tx_b, rx_b) = C::unbounded()?;
-    let barrier = Arc::new(Barrier::new(3));
+    let (tx_a, mut rx_a) = C::unbounded()?;
+    let (tx_b, mut rx_b) = C::unbounded()?;
+    // Wait until workers are ready, then time the start gate and full workload.
+    let ready = Arc::new(Barrier::new(3));
+    let start_gate = Arc::new(Barrier::new(3));
 
-    let b = barrier.clone();
+    let ready_e = ready.clone();
+    let start_e = start_gate.clone();
     let pin_e: Vec<usize> = pin.to_vec();
     let echo = thread::spawn(move || {
         pin_worker(&pin_e, 1);
-        b.wait();
+        ready_e.wait();
+        start_e.wait();
         for _ in 0..rounds {
-            let v = recv_spin::<C>(&rx_a);
+            let v = recv_spin::<C>(&mut rx_a);
             send_spin::<C>(&tx_b, v);
         }
     });
 
-    let b = barrier.clone();
+    let ready_i = ready.clone();
+    let start_i = start_gate.clone();
     let pin_i: Vec<usize> = pin.to_vec();
     let initiator = thread::spawn(move || {
         pin_worker(&pin_i, 0);
-        b.wait();
+        ready_i.wait();
+        start_i.wait();
         let mut sum = 0u64;
         for i in 0..rounds as u64 {
             send_spin::<C>(&tx_a, i);
-            sum += recv_spin::<C>(&rx_b);
+            sum += recv_spin::<C>(&mut rx_b);
         }
         sum
     });
 
-    barrier.wait();
+    ready.wait();
     let start = Instant::now();
+    start_gate.wait();
     let sum = initiator.join().expect("initiator thread panicked");
     let elapsed = start.elapsed().as_nanos() as f64;
     echo.join().expect("echo thread panicked");

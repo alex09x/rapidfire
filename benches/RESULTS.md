@@ -275,6 +275,13 @@ cores and are therefore oversubscribed on every machine; see the notes below.
 
 Notes on the raw harness:
 
+- Historical protocol: the raw tables above used a Tokio receiver adapter with a
+  mutex per `try_recv`, a shared per-message completion counter in MPMC 4→4, and
+  timestamps taken after workers were released. The current harness uses owned
+  mutable receivers and fixed local consumer quotas summing to the actual message
+  count. Workers first signal readiness; timing then starts before the start barrier
+  releases them, so barrier release overhead is included. Historical numeric cells
+  are preserved and have not been remeasured with the corrected harness.
 - `std mpsc` and `tokio mpsc` have a single receiver, so MPMC is n/a for them; the
   `ArrayQueue` rows only exist for the bounded scenarios; `SegQueue` is unbounded only.
 - MPSC 8→1 is oversubscribed (nine threads on eight or six pinned cores). rapidfire's
@@ -487,6 +494,9 @@ command/response), median of 5 runs.
 
 Notes on the real-case harness:
 
+- Historical protocol: these tables recorded the start timestamp after workers
+  were released. The current harness waits for workers to be ready, then starts
+  timing before releasing them through a second barrier. Release overhead is included.
 - In the synchronous bounded cases a producer that finds the channel full spins on
   `try_send` (see above); a real sender parks (`send().await`) instead.
 - In the async cells with 256–1024-byte payloads async-channel is ahead on Zen 4 once the
@@ -498,6 +508,10 @@ Notes on the real-case harness:
 
 `perf stat` and `perf record`/`annotate` on the `quick` example, 2 M messages, one run,
 rapidfire versus crossbeam `SegQueue` (the closest competitor), same pinned cores.
+Historical parallel `quick` runs used a shared per-message completion counter and
+post-barrier timing. The example now uses local consumer quotas and pre-start timing;
+its Tokio adapter also no longer adds a receiver mutex. Checksums are verified after
+timing, including when the requested count is not divisible by the worker count.
 No inline assembly is used in the shipped build: the hot paths are the compiler's own
 atomics, checked instruction by instruction with `objdump` (`examples/asm_probe.rs`).
 
