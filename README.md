@@ -40,6 +40,11 @@ are medians of 5 runs after a warm-up; the full set for every machine and scenar
 perf profiles and the notes on the cells we lose are in
 [`benches/RESULTS.md`](benches/RESULTS.md).
 
+These tables preserve the original 0.1.0 measurements. The current harness removes a
+Tokio-only receiver mutex and the MPMC per-message completion counter, and starts timing
+before releasing workers. See the methodology note in `benches/RESULTS.md`; use the current
+harness for new comparisons rather than treating the historical ratios as corrected runs.
+
 Toolchain and library versions: rustc 1.97.1 (8bab26f4f 2026-07-14), `-C target-cpu=native`,
 `lto = "fat"`, `codegen-units = 1`; compared against crossbeam-queue 0.3.14 (`SegQueue`,
 `ArrayQueue`), flume 0.11.1, async-channel 2.5.0, tokio 1.53.1 (`sync::mpsc`) and
@@ -301,8 +306,11 @@ The same tables for the Ryzen 9 7950X, the Neoverse-N1 box and the M3 Pro are in
   writes the value and publishes the slot with a Release store.
 - A consumer looks at the head slot's lap-tagged state and claims it with a CAS only once
   it is written, so it never waits on a producer and the head never moves past an
-  unwritten slot. The consumer that takes the last slot moves the head to the next block,
-  waits for the other readers' marks and recycles the block.
+  unwritten slot. The consumer that takes the last slot moves the head to the next block
+  and recycles the old block if its other readers have finished. A still-busy block is retired
+  without waiting and reclaimed by an installing producer once all readers are done.
+  Waiting for a paused head transition also has a bounded spin budget, so an async
+  receiver can return control to its executor.
 - Blocks are never freed while the channel lives (a spare slot plus a pool), which is
   what makes stale block pointers safe to inspect. Memory stays at the channel's
   high-water mark until it is dropped.
@@ -330,13 +338,13 @@ locked claim and in the slot-line transfers between cores, not in the generated 
 
 ## Verification
 
-- `cargo test` — 10 unit, 46 integration (std threads and tokio: MPMC stress with every
+- `cargo test` — 12 unit, 46 integration (std threads and tokio: MPMC stress with every
   value received exactly once, bounded back-pressure across block boundaries, cancellation
   storms in `select!`, close while parked, Drop accounting, zero-sized and large payloads,
   waker re-registration, Debug/Display) and doc tests; also run with
   `RUSTFLAGS="--cfg fcrs_small_blocks"` (3-slot blocks) so every test crosses block
-  boundaries and recycles blocks constantly. `cargo llvm-cov` reports 97.8 % of lines and
-  98.3 % of functions of the core covered (the rest is cold error handling).
+  boundaries and recycles blocks constantly. The 0.1.0 `cargo llvm-cov` run reported
+  97.8 % of lines and 98.3 % of functions of the core covered.
 - `cargo test --release --features loom --test loom` — loom model checks of the
   producer/consumer protocol, block transitions, close and the sleep/wake hand-off.
 - `cargo +nightly miri test --lib` (with the small-block cfg) — no undefined behaviour in

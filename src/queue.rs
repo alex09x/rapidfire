@@ -6,8 +6,8 @@
 //! `next` pointer.  Positions are absolute `usize` indices; a block covers one *lap* of
 //! `LAP` consecutive positions and the last position of every lap (`offset ==
 //! BLOCK_CAP`) is a **sentinel** that never holds a value.  A producer or consumer that
-//! observes its index on the sentinel knows a block transition is in flight and spins
-//! for the few nanoseconds it takes.
+//! observes its index on the sentinel knows a block transition is in flight. Consumers
+//! spin briefly, then return to the caller if the transitioning consumer is paused.
 //!
 //! * Producers claim a slot on `tail.index`, adaptively.  While no contention has been
 //!   observed recently the claim is a wait-free `fetch_add`; contention (another claim
@@ -25,8 +25,8 @@
 //!   of a block installs the next block (from the pool, otherwise freshly allocated),
 //!   links it, publishes its `start` with Release (so a walker that sees the start
 //!   also sees the links) and publishes it as `tail.block` before writing its own
-//!   value.  Recycling resets only `start`; links keep pointing at old, never freed
-//!   blocks so a stale walker always lands on valid memory.
+//!   value. Recycling clears the reader marks and resets `start`; links keep pointing
+//!   at old, never freed blocks so a stale walker always lands on valid memory.
 //! * Consumers first check the **slot state** of the head slot and claim it with a CAS
 //!   on `head.index` only once the value is there.  They never read `tail.index`, so
 //!   the producers' cache line stays private to producers: the only lines that cross
@@ -37,13 +37,14 @@
 //!   head run ahead of a pre-empted producer and let the blocks behind be recycled,
 //!   which strands that producer's block lookup; that variant deadlocked on a 128-core
 //!   box and was removed.)  The consumer that claims the last slot moves `head.block`
-//!   to the next block, waits until every other slot of the old block has been read
-//!   and hands the block back to the pool.
-//! * Slot states are **tagged with the lap number**, so a recycled block needs no
-//!   reset: an old tag can never be mistaken for the current lap's `WRITTEN`.
+//!   to the next block and hands the old block back to the pool if its readers have
+//!   finished. Otherwise it retires the block without waiting; an installing producer
+//!   can reclaim it once every reader has finished.
+//! * Slot states are **tagged with the lap number**, so they need no reset when a
+//!   block is recycled: an old tag cannot be mistaken for the current lap's `WRITTEN`.
 //! * Blocks are **never freed while the queue lives**; they cycle through a one-block
-//!   spare slot and a mutex-protected overflow pool (touched once per 63 values at
-//!   most).  This is what makes it sound to dereference a block pointer that may be
+//!   spare slot and a mutex-protected overflow pool, accessed only when acquiring or
+//!   recycling blocks. This makes it sound to dereference a block pointer that may be
 //!   stale: it always points at valid memory, a pooled block carries `start ==
 //!   usize::MAX`, a re-linked one carries a start that can never equal a lap it served
 //!   before, a stale slot state can never match the current lap, and the CAS on
@@ -256,9 +257,9 @@ struct ProducerHeader<T> {
 }
 
 /// Consumer-side block header, on its own cache line: `read_marks` is written by
-/// consumers and read by the recycling consumer only, so consumers never write to the
-/// slot lines (which producers own until the value is read) and producers never touch
-/// this line.
+/// consumers and checked by the recycling consumer. Producers only check this line
+/// when reclaiming a retired block on the allocation slow path. Consumers never write
+/// to the slot lines, which producers own until the value is read.
 #[repr(C)]
 struct ConsumerHeader {
     read_marks: [AtomicU8; BLOCK_CAP],
@@ -308,17 +309,32 @@ impl<T> Block<T> {
         dealloc(block as *mut u8, Self::LAYOUT);
     }
 
-    #[inline(always)]
-    fn wait_next(&self) -> *mut Block<T> {
-        let mut backoff = Backoff::new();
-        loop {
-            let next = self.phdr.0.next.load(Acquire);
-            if !next.is_null() {
-                return next;
-            }
-            backoff.snooze();
-        }
+    /// The last slot belongs to the retiring consumer itself; only earlier readers
+    /// can still be using this block. An Acquire observes the end of each read.
+    #[inline]
+    fn readers_done(&self) -> bool {
+        self.chdr.0.read_marks[..BLOCK_CAP - 1]
+            .iter()
+            .all(|mark| mark.load(Acquire) != 0)
     }
+
+    /// # Safety
+    /// All readers must have finished, and the caller must exclusively own recycling
+    /// this block. It must not be reachable through the live head/tail chain.
+    unsafe fn reset(&self) {
+        for mark in &self.chdr.0.read_marks {
+            mark.store(0, Relaxed);
+        }
+        // Keep the links intact for stale walkers, which re-validate `start`.
+        self.phdr.0.start.store(POOLED, Relaxed);
+    }
+}
+
+/// Blocks outside the live chain. A retired block still belongs to its outstanding
+/// readers and must pass `readers_done` before it can be reused.
+struct BlockPool<T> {
+    ready: Vec<*mut Block<T>>,
+    retired: Vec<*mut Block<T>>,
 }
 
 struct Position<T> {
@@ -347,7 +363,7 @@ pub(crate) struct Queue<T> {
     /// the producer that needs a new block.
     spare: CachePadded<AtomicPtr<Block<T>>>,
     /// Overflow pool for recycled blocks (see the module docs on never freeing).
-    pool: Mutex<Vec<*mut Block<T>>>,
+    pool: Mutex<BlockPool<T>>,
     /// Bounded capacity, or `UNBOUNDED`.  A plain word rather than `Option<usize>` so
     /// the hot path tests one load instead of a discriminant plus a value.
     capacity: usize,
@@ -378,7 +394,10 @@ impl<T> Queue<T> {
                 contended: AtomicUsize::new(0),
             }),
             spare: CachePadded(AtomicPtr::new(ptr::null_mut())),
-            pool: Mutex::new(Vec::new()),
+            pool: Mutex::new(BlockPool {
+                ready: Vec::new(),
+                retired: Vec::new(),
+            }),
             capacity: capacity.unwrap_or(UNBOUNDED),
         }
     }
@@ -432,7 +451,7 @@ impl<T> Queue<T> {
     }
 
     #[inline]
-    fn lock_pool(&self) -> crate::sync::MutexGuard<'_, Vec<*mut Block<T>>> {
+    fn lock_pool(&self) -> crate::sync::MutexGuard<'_, BlockPool<T>> {
         self.pool.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -447,7 +466,23 @@ impl<T> Queue<T> {
 
     #[cold]
     fn take_block_slow(&self) -> *mut Block<T> {
-        if let Some(block) = self.lock_pool().pop() {
+        let retired = {
+            let mut pool = self.lock_pool();
+            if let Some(block) = pool.ready.pop() {
+                return block;
+            }
+            // Never wait for a reader. If no retired block is ready, allocate another
+            // block. Removal under the lock gives this producer sole recycling rights.
+            let ready = pool.retired.iter().position(|&block| {
+                // SAFETY: retired blocks are allocated and stay outside the live chain.
+                unsafe { (*block).readers_done() }
+            });
+            ready.map(|i| pool.retired.swap_remove(i))
+        };
+        if let Some(block) = retired {
+            // SAFETY: every reader's Release mark was observed with Acquire above,
+            // and no other producer can remove the same block from the retired list.
+            unsafe { (*block).reset() };
             return block;
         }
         Block::allocate()
@@ -471,7 +506,7 @@ impl<T> Queue<T> {
 
     #[cold]
     fn recycle_slow(&self, block: *mut Block<T>) {
-        self.lock_pool().push(block);
+        self.lock_pool().ready.push(block);
     }
 
     /// Appends `value`.  Returns `Err(value)` only when a bounded queue is full.
@@ -721,7 +756,8 @@ impl<T> Queue<T> {
     }
 
     /// Removes the oldest value, or returns `None` if no *written* value is at the head
-    /// (empty, or the head slot is still being written by its producer).
+    /// (empty, the head slot is still being written, or a head transition exceeded
+    /// the bounded spinning budget).
     ///
     /// On success also returns whether `wake_flag` (the parked-senders counter of a
     /// bounded channel) was non-zero when sampled right after the slot was claimed; the
@@ -735,9 +771,12 @@ impl<T> Queue<T> {
         loop {
             let offset = head & OFFSET_MASK;
 
-            // Another consumer is moving the head to the next block: wait for it.
+            // A consumer may be pre-empted while moving the head. Return to the
+            // caller after a bounded spin so an async receiver can yield its executor.
             if offset == BLOCK_CAP {
-                backoff.snooze();
+                if !backoff.snooze_bounded() {
+                    return None;
+                }
                 head = self.head.index.load(Acquire);
                 block = self.head.block.load(Acquire);
                 continue;
@@ -808,30 +847,26 @@ impl<T> Queue<T> {
         // possible.  The installing producer linked `next` before writing this slot,
         // and it published `tail.block = next` too, so nobody will look for this block
         // once it is recycled.
-        let next = (*block).wait_next();
+        let next = (*block).phdr.0.next.load(Acquire);
+        debug_assert!(
+            !next.is_null(),
+            "last slot was published before its next block"
+        );
         self.head.block.store(next, Release);
         // An RMW, not a plain store: a plain store would end the release sequence that
         // a parked bounded sender started with its `fetch_add(0)` on this index (see
         // the module docs), and later consumer CASes would no longer synchronise with it.
         self.head.index.swap(head + 2, AcqRel);
 
-        // Every earlier slot of this block was claimed before ours by a consumer that
-        // had already seen it written; wait for those readers to finish, then hand the
-        // block back.
-        let marks = &(*block).chdr.0.read_marks;
-        for mark in marks.iter().take(BLOCK_CAP - 1) {
-            let mut wait = Backoff::new();
-            while mark.load(Acquire) == 0 {
-                wait.snooze();
-            }
+        // Every earlier slot was claimed before ours, but its reader may be paused
+        // before copying the value or marking the read. Leave that block untouched
+        // until a future installer observes every Release mark; do not hold this
+        // consumer (and possibly an executor worker) hostage to the paused reader.
+        if !(*block).readers_done() {
+            self.lock_pool().retired.push(block);
+            return;
         }
-        for mark in marks.iter() {
-            mark.store(0, Relaxed);
-        }
-        // Only `start` is reset.  `prev`/`next` deliberately keep pointing at their old
-        // (never freed) blocks: a stale walker that read the old start and then follows
-        // `prev` must land on valid memory, and it re-validates by `start` there.
-        (*block).phdr.0.start.store(POOLED, Relaxed);
+        (*block).reset();
         self.recycle(block);
     }
 
@@ -872,7 +907,10 @@ impl<T> Queue<T> {
                 h, h >> LAP_SHIFT, hoff, hb, hs as isize, hstate, written_tag(h >> LAP_SHIFT),
                 self.head.contended.load(Relaxed),
                 t, tb, ts as isize, self.tail.contended.load(Relaxed),
-                self.spare.load(Relaxed), self.lock_pool().len(), chain
+                self.spare.load(Relaxed), {
+                    let pool = self.lock_pool();
+                    pool.ready.len() + pool.retired.len()
+                }, chain
             )
         }
     }
@@ -913,8 +951,10 @@ impl<T> Drop for Queue<T> {
             if !spare.is_null() {
                 Block::release(spare);
             }
-            let pool = std::mem::take(&mut *self.lock_pool());
-            for block in pool {
+            let pool = &mut *self.lock_pool();
+            // Exclusive channel destruction means even deferred readers have
+            // finished. All values in retired blocks were already claimed and moved.
+            for block in pool.ready.drain(..).chain(pool.retired.drain(..)) {
                 Block::release(block);
             }
         }
@@ -962,7 +1002,7 @@ mod tests {
             assert_eq!(q.pop(&flag).map(|v| v.0), Some(round + 1));
         }
         assert_eq!(q.pop(&flag).map(|v| v.0), None);
-        assert!(q.lock_pool().len() <= 1);
+        assert!(q.lock_pool().ready.len() <= 1);
     }
 
     #[test]
@@ -979,7 +1019,7 @@ mod tests {
             assert_eq!(q.pop(&flag).map(|v| v.0), None);
         }
         // Blocks were reused, not re-allocated: the pool holds the ones from round 0.
-        assert!(q.lock_pool().len() >= 15);
+        assert!(q.lock_pool().ready.len() >= 15);
     }
 
     #[test]
@@ -1025,6 +1065,87 @@ mod tests {
         assert!(q.claims_below(tail));
         assert_eq!(q.pop(&flag).map(|v| v.0), Some(7));
         assert!(!q.claims_below(tail));
+    }
+
+    #[test]
+    fn retired_block_stays_live_until_its_reader_finishes() {
+        for reclaim in [false, true] {
+            let q = Queue::new(None);
+            let flag = AtomicUsize::new(0);
+            for i in 0..LAP {
+                q.push(Box::new(i), &flag).unwrap();
+            }
+
+            // Pause a consumer after its successful head CAS, before it copies the
+            // first value. Other consumers must keep making progress without reusing
+            // this block, even as later blocks are repeatedly recycled.
+            let block = q.head.block.load(Acquire);
+            let slot = unsafe { &(*block).slots[0] };
+            assert_eq!(slot.state.load(Acquire), written_tag(0));
+            q.head
+                .index
+                .compare_exchange(0, 1, AcqRel, Acquire)
+                .unwrap();
+            for expected in 1..LAP {
+                assert_eq!(*q.pop(&flag).unwrap().0, expected);
+            }
+            for value in LAP..8 * LAP {
+                q.push(Box::new(value), &flag).unwrap();
+                assert_eq!(*q.pop(&flag).unwrap().0, value);
+            }
+            assert_eq!(q.lock_pool().retired.as_slice(), &[block]);
+
+            // The paused reader still owns the original Box; recycling it early
+            // would corrupt this value or cause a double-free (also checked by Miri).
+            let held = unsafe { slot.value.with(|p| p.read().assume_init()) };
+            assert_eq!(*held, 0);
+            unsafe { mark_read(&(*block).chdr.0.read_marks[0]) };
+            drop(held);
+
+            if reclaim {
+                // No ready overflow blocks exist in this interleaved workload, so
+                // the next slow allocation must reclaim the now-finished block.
+                assert!(q.lock_pool().ready.is_empty());
+                let reused = q.take_block_slow();
+                assert_eq!(reused, block);
+                assert!(q.lock_pool().retired.is_empty());
+                unsafe { q.recycle(reused) };
+            }
+            // Both reclamation and dropping a still-retired, now-quiescent block
+            // must release its allocation without dropping any moved-out Box twice.
+            drop(q);
+        }
+    }
+
+    #[test]
+    fn stalled_head_transition_returns_to_the_caller() {
+        let q = Queue::new(None);
+        let flag = AtomicUsize::new(0);
+        for i in 0..LAP {
+            q.push(i, &flag).unwrap();
+        }
+        for expected in 0..BLOCK_CAP - 1 {
+            assert_eq!(q.pop(&flag).unwrap().0, expected);
+        }
+
+        // Pause the last consumer between claiming the final value and publishing
+        // the next head. A peer's pop must return instead of waiting for this peer.
+        let head = BLOCK_CAP - 1;
+        let block = q.head.block.load(Acquire);
+        let slot = unsafe { &(*block).slots[head] };
+        assert_eq!(slot.state.load(Acquire), written_tag(0));
+        q.head
+            .index
+            .compare_exchange(head, head + 1, AcqRel, Acquire)
+            .unwrap();
+        let held = unsafe { slot.value.with(|p| p.read().assume_init()) };
+        assert_eq!(held, head);
+        assert!(q.pop(&flag).is_none());
+        // An async receiver must still recognize the queued next-block value and
+        // arrange another poll instead of sleeping through this head transition.
+        assert!(q.claims_below(q.receiver_parking()));
+        unsafe { q.finish_block(block, head) };
+        assert_eq!(q.pop(&flag).unwrap().0, BLOCK_CAP);
     }
 
     #[test]

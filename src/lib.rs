@@ -16,7 +16,7 @@
 //!   and claim it with a CAS only once the value is there, so they never touch the
 //!   producers' cache line.  See `queue.rs` for the full protocol and its proofs.
 //! - **Lap-tagged slot states, never-freed blocks.**  A slot's state word carries the
-//!   block's lap number, so recycled blocks need no reset and a stale state can never
+//!   block's lap number, so recycled slot states need no reset and a stale state can never
 //!   be mistaken for a fresh one.  Blocks cycle through a spare slot and a small pool
 //!   instead of being freed, which is what makes it sound to look at a slot before
 //!   owning it.  Memory stays at the channel's high-water mark until it is dropped.
@@ -261,6 +261,13 @@ impl WaiterList {
     #[cold]
     fn unregister(&self, count: &AtomicUsize, id: &mut Option<u64>, forward: bool) {
         if let Some(my) = id.take() {
+            // This future's registration increment happens-before this load. A later
+            // zero count therefore proves its entry was already removed by a notify.
+            // Concurrent registrations cannot restore our entry. Cancellation keeps
+            // the locked path so an absorbed wake-up is still forwarded.
+            if !forward && count.load(Acquire) == 0 {
+                return;
+            }
             let mut list = self.lock();
             if let Some(pos) = list.iter().position(|(entry_id, _)| *entry_id == my) {
                 list.remove(pos);
@@ -378,16 +385,15 @@ impl<T> Inner<T> {
                 Ok(msg) => return Ok(msg),
                 Err(RecvState::Empty) => return Err(TryRecvError::Empty),
                 Err(RecvState::Closed) => return Err(TryRecvError::Closed),
-                // Closed with a value being written right now: no new claims can
-                // arrive, so wait for it rather than report `Closed` with a value in
-                // flight.
+                // Closed with an undrained value: wait for its writer or a pending
+                // head transition rather than report `Closed` before draining it.
                 Err(RecvState::Busy) => wait.snooze(),
             }
         }
     }
 
-    /// One attempt to receive.  `Busy` means the channel is closed but a producer is
-    /// still mid-`push` on a claimed slot.
+    /// One attempt to receive. `Busy` means the closed channel still has values
+    /// awaiting publication or a head transition.
     #[inline(always)]
     fn try_recv_nonblocking(&self) -> Result<T, RecvState> {
         if let Some((msg, wake)) = self.queue.pop(&self.flags.waiting_senders) {
@@ -416,11 +422,11 @@ impl<T> Inner<T> {
 
 /// Outcome of a receive attempt that found no value.
 enum RecvState {
-    /// Nothing claimed at the head (as far as the caller can tell).
+    /// No value available on this attempt while the channel is open.
     Empty,
     /// Closed and drained.
     Closed,
-    /// Closed, but a claimed slot is still being written.
+    /// Closed, but a write or head transition is still in flight.
     Busy,
 }
 
@@ -831,11 +837,9 @@ impl<T> Future for Recv<'_, T> {
                 // Truly empty as of the snapshot: every later claim will see our flag.
                 return Poll::Pending;
             }
-            // A producer claimed a slot before our flag was visible (or the channel is
-            // closed with one write in flight) and has not written it yet; it will not
-            // wake us.  Its write is normally nanoseconds away, so poll briefly; if it
-            // is being slow (pre-empted), hand the thread back to the executor and ask
-            // to be polled again rather than spin inside `poll`.
+            // A write claimed before our registration, or a paused head transition,
+            // may complete without waking us. Poll briefly, then return the thread
+            // to the executor and ask to be polled again if the peer is still paused.
             if !wait.snooze_bounded() {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
