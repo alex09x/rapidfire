@@ -204,13 +204,14 @@ impl<T> Future for Recv<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        // Consume the previous registration before taking a value, matching the
+        // shared receiver's notification protocol.
+        this.unregister(false);
         match this.receiver.try_recv_nonblocking() {
             Ok(value) => {
-                this.unregister(false);
                 return Poll::Ready(Ok(value));
             }
             Err(RecvState::Closed) => {
-                this.unregister(false);
                 return Poll::Ready(Err(RecvError));
             }
             Err(_) => {}
@@ -227,7 +228,7 @@ impl<T> Future for Recv<'_, T> {
         loop {
             let busy = match this.receiver.try_recv_nonblocking() {
                 Ok(value) => {
-                    this.unregister(false);
+                    this.unregister(true);
                     return Poll::Ready(Ok(value));
                 }
                 Err(RecvState::Closed) => {
