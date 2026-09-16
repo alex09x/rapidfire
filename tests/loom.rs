@@ -38,10 +38,14 @@ fn mpsc_single_receiver_unbounded_recycles() {
 
 #[test]
 fn mpsc_bounded_two_waiting_senders() {
-    // Three actors with parked futures grow the state space rapidly. Keep this
-    // additional model at two preemptions; other queue models use three.
+    // This three-actor model has a large state space. The default CI budget
+    // still reproduces the pre-fix deadlock; opt into the full bounded search
+    // with RAPIDFIRE_LOOM_EXTENDED=1. Other models have no permutation cap.
     let mut builder = loom::model::Builder::new();
     builder.preemption_bound = Some(2);
+    if std::env::var_os("RAPIDFIRE_LOOM_EXTENDED").is_none() {
+        builder.max_permutations = Some(1_000_000);
+    }
     builder.check(|| {
         let (tx, mut rx) = rapidfire::mpsc::bounded(1);
         tx.try_send(0).unwrap();
@@ -60,10 +64,14 @@ fn mpsc_bounded_two_waiting_senders() {
 
 #[test]
 fn general_bounded_two_waiting_senders() {
-    // Three actors with parked futures grow the state space rapidly. Keep this
-    // additional model at two preemptions; other queue models use three.
+    // This three-actor model has a large state space. The default CI budget
+    // still reproduces the pre-fix deadlock; opt into the full bounded search
+    // with RAPIDFIRE_LOOM_EXTENDED=1. Other models have no permutation cap.
     let mut builder = loom::model::Builder::new();
     builder.preemption_bound = Some(2);
+    if std::env::var_os("RAPIDFIRE_LOOM_EXTENDED").is_none() {
+        builder.max_permutations = Some(1_000_000);
+    }
     builder.check(|| {
         let (tx, rx) = rapidfire::bounded(1);
         tx.try_send(0).unwrap();

@@ -391,6 +391,39 @@ async fn main() {
 }
 ```
 
+### One receiver and receive batches (current Git version)
+
+The current Git version also provides `rapidfire::mpsc::{bounded, unbounded}`.
+These additions are not in the published 0.1.0 crate yet. They return the usual
+cloneable `Sender` and an exclusive receiver: declare it `mut`; it cannot be cloned.
+
+```rust
+use rapidfire::mpsc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (tx, mut rx) = mpsc::bounded(4096);
+    tx.send(42u64).await?;
+    let mut batch = Vec::with_capacity(32);
+    let received = rx.recv_many(&mut batch, 32).await?;
+    assert_eq!(received, 1);
+    assert_eq!(batch, [42]);
+    Ok(())
+}
+```
+
+`recv_many` appends ready messages to the existing buffer, waits only for the first
+message, and never waits to fill the batch. A zero limit returns `Ok(0)` immediately;
+otherwise a closed, drained channel returns `Err(RecvError)`. Reuse the buffer and
+clear or drain it after processing. Cancellation while pending consumes no messages.
+
+An exclusive receiver skips coordination between consumers. Native batches also
+publish freed capacity once per block-sized chunk and wake the corresponding
+number of blocked senders. The general MPMC constructors retain their existing API.
+This is an opt-in tradeoff: bounded async batches improved in the tested workloads,
+while some synchronous and unbounded cases were slower. See the
+[MPSC comparison and latency measurements](benches/MPSC.md) before choosing a mode.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or

@@ -154,7 +154,7 @@ impl<T> Receiver<T> {
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
-    /// Returns the number of queued messages (including pending publications).
+    /// Returns an approximate queued count, including pending publications.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
