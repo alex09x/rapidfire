@@ -69,6 +69,12 @@ impl<const PAD: usize> Msg<PAD> {
     }
 }
 
+fn pin_error(message: impl std::fmt::Display) -> ! {
+    // A panic in one worker would leave other workers waiting at the start gate.
+    eprintln!("invalid benchmark CPU placement: {message}");
+    std::process::exit(2);
+}
+
 fn pin(slot: usize) {
     let cpus = std::env::var("MPSC_PIN").unwrap_or_default();
     if cpus.is_empty() {
@@ -77,22 +83,25 @@ fn pin(slot: usize) {
     let cpu: usize = cpus
         .split(',')
         .nth(slot)
-        .expect("pin list must cover every worker")
+        .unwrap_or_else(|| pin_error("pin list must cover every worker"))
         .parse()
-        .unwrap();
+        .unwrap_or_else(|_| pin_error("invalid CPU ID"));
     #[cfg(target_os = "linux")]
     unsafe {
         unsafe extern "C" {
             fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
         }
         let mut mask = [0u64; 16];
-        assert!(cpu < 1024);
+        if cpu >= 1024 {
+            pin_error("CPU ID must be less than 1024");
+        }
         mask[cpu / 64] |= 1 << (cpu % 64);
-        assert_eq!(
-            sched_setaffinity(0, 128, mask.as_ptr()),
-            0,
-            "affinity failed"
-        );
+        if sched_setaffinity(0, 128, mask.as_ptr()) != 0 {
+            pin_error(format!(
+                "affinity failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
     }
     #[cfg(target_os = "macos")]
     unsafe {
@@ -100,11 +109,13 @@ fn pin(slot: usize) {
             fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
         }
         let _ = cpu; // macOS has no CPU affinity API; request QoS only.
-        assert_eq!(
-            pthread_set_qos_class_self_np(0x21, 0),
-            0,
-            "QoS request failed"
-        );
+        let code = pthread_set_qos_class_self_np(0x21, 0);
+        if code != 0 {
+            pin_error(format!(
+                "QoS request failed: {}",
+                std::io::Error::from_raw_os_error(code)
+            ));
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

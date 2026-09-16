@@ -58,6 +58,13 @@ const ROUNDTRIP_DIV: usize = 10;
 // CPU pinning
 // ============================================================================
 
+// Exiting the benchmark process also stops workers already waiting at a barrier.
+// Panicking in only the worker with a bad pin would strand its peers forever.
+fn pin_error(message: impl std::fmt::Display) -> ! {
+    eprintln!("invalid benchmark CPU placement: {message}");
+    std::process::exit(2);
+}
+
 #[cfg(target_os = "linux")]
 extern "C" {
     fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
@@ -72,15 +79,19 @@ const CPU_SET_WORDS: usize = 16;
 fn pin_to_core(core: usize) {
     let word = core / 64;
     if word >= CPU_SET_WORDS {
-        return;
+        pin_error(format!("CPU ID {core} out of range"));
     }
     let mut mask = [0u64; CPU_SET_WORDS];
     mask[word] = 1u64 << (core % 64);
     // SAFETY: `mask` is a live, properly aligned [u64; 16] of exactly the size we
     // pass as `cpusetsize` (128 bytes = cpu_set_t); pid 0 means "the calling thread".
     // The kernel only reads `cpusetsize` bytes from the pointer.
-    unsafe {
-        sched_setaffinity(0, CPU_SET_WORDS * 8, mask.as_ptr());
+    let ret = unsafe { sched_setaffinity(0, CPU_SET_WORDS * 8, mask.as_ptr()) };
+    if ret != 0 {
+        pin_error(format!(
+            "sched_setaffinity failed for core {core}: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 }
 
@@ -93,8 +104,12 @@ fn pin_to_core(_core: usize) {
     }
     const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
     // SAFETY: plain libc call affecting only the calling thread.
-    unsafe {
-        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    let ret = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+    if ret != 0 {
+        pin_error(format!(
+            "pthread_set_qos_class_self_np failed: {}",
+            std::io::Error::from_raw_os_error(ret)
+        ));
     }
 }
 
@@ -103,8 +118,15 @@ fn pin_to_core(_core: usize) {}
 
 /// Pins the calling thread if a core was configured for worker slot `k`.
 fn pin_worker(pin: &[usize], k: usize) {
-    if let Some(&core) = pin.get(k) {
-        pin_to_core(core);
+    if pin.is_empty() {
+        return;
+    }
+    match pin.get(k) {
+        Some(&core) => pin_to_core(core),
+        None => pin_error(format!(
+            "worker slot {k} not found in nonempty pin list (length {})",
+            pin.len()
+        )),
     }
 }
 
@@ -193,6 +215,38 @@ impl<T: Payload> Chan<T> for Fast {
         match cap {
             Some(c) => rapidfire::bounded(c),
             None => rapidfire::unbounded(),
+        }
+    }
+    fn try_send(tx: &Self::Tx, v: T) -> Result<(), T> {
+        tx.try_send(v).map_err(|e| e.into_inner())
+    }
+    fn try_recv(rx: &mut Self::Rx) -> Option<T> {
+        rx.try_recv().ok()
+    }
+    fn send_async<'a>(tx: &'a Self::Tx, v: T) -> impl Future<Output = ()> + Send + 'a {
+        async move {
+            let _ = tx.send(v).await;
+        }
+    }
+    fn recv_async<'a>(rx: &'a mut Self::Rx) -> impl Future<Output = Option<T>> + Send + 'a {
+        async move { rx.recv().await.ok() }
+    }
+}
+
+// ----------------------------------------------------------- rapidfire_mpsc
+
+struct FastMpsc;
+
+impl<T: Payload> Chan<T> for FastMpsc {
+    type Tx = rapidfire::Sender<T>;
+    type Rx = rapidfire::mpsc::Receiver<T>;
+
+    const NAME: &'static str = "rapidfire_mpsc";
+
+    fn channel(cap: Option<usize>) -> (Self::Tx, Self::Rx) {
+        match cap {
+            Some(c) => rapidfire::mpsc::bounded(c),
+            None => rapidfire::mpsc::unbounded(),
         }
     }
     fn try_send(tx: &Self::Tx, v: T) -> Result<(), T> {
@@ -727,12 +781,19 @@ fn parse_cfg(args: &[String]) -> Cfg {
         } else if let Some(v) = arg.strip_prefix("--filter=") {
             cfg.filter = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--pin=") {
-            cfg.pin = v
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .filter_map(|s| s.parse::<usize>().ok())
-                .collect();
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                cfg.pin = Vec::new();
+            } else {
+                cfg.pin = trimmed
+                    .split(',')
+                    .map(str::trim)
+                    .map(|s| {
+                        s.parse::<usize>()
+                            .unwrap_or_else(|e| panic!("malformed pin entry '{s}': {e}"))
+                    })
+                    .collect();
+            }
         } else if let Some(v) = arg.strip_prefix("--n=") {
             n_override = v.parse::<usize>().ok();
         }
@@ -775,6 +836,7 @@ struct Row {
     ns: f64,
     ops: usize,
     runs: usize,
+    samples_ns_per_op: Vec<f64>,
 }
 
 type ScenarioFn = fn(&Ctx<'_>) -> Sample;
@@ -855,6 +917,7 @@ fn bench_impl<T: Payload, C: Chan<T>>(ctx: &Ctx<'_>, imp_idx: usize, out: &mut V
         for _ in 0..ctx.cfg.runs {
             samples.push(f(ctx).ns);
         }
+        let med = median(samples.clone());
         out.push(Row {
             topo,
             topo_idx: k / 2,
@@ -863,18 +926,20 @@ fn bench_impl<T: Payload, C: Chan<T>>(ctx: &Ctx<'_>, imp_idx: usize, out: &mut V
             mode_idx: k % 2,
             imp: C::NAME,
             imp_idx,
-            ns: median(samples),
+            ns: med,
             ops: warm.ops,
             runs: ctx.cfg.runs,
+            samples_ns_per_op: samples,
         });
     }
 }
 
 fn bench_payload<T: Payload>(ctx: &Ctx<'_>, out: &mut Vec<Row>) {
     bench_impl::<T, Fast>(ctx, 0, out);
-    bench_impl::<T, AsyncCh>(ctx, 1, out);
-    bench_impl::<T, TokioMpsc>(ctx, 2, out);
-    bench_impl::<T, FlumeCh>(ctx, 3, out);
+    bench_impl::<T, FastMpsc>(ctx, 1, out);
+    bench_impl::<T, AsyncCh>(ctx, 2, out);
+    bench_impl::<T, TokioMpsc>(ctx, 3, out);
+    bench_impl::<T, FlumeCh>(ctx, 4, out);
 }
 
 fn print_table(cfg: &Cfg, rows: &[Row]) {
@@ -934,8 +999,14 @@ fn print_table(cfg: &Cfg, rows: &[Row]) {
 
 fn print_json(rows: &[Row]) {
     for r in rows {
+        let samples = r
+            .samples_ns_per_op
+            .iter()
+            .map(|s| format!("{s:.3}"))
+            .collect::<Vec<_>>()
+            .join(",");
         println!(
-            "{{\"topology\":\"{}\",\"payload_bytes\":{},\"mode\":\"{}\",\"impl\":\"{}\",\"ns_per_op\":{:.3},\"mops\":{:.3},\"ops\":{},\"runs\":{}}}",
+            "{{\"topology\":\"{}\",\"payload_bytes\":{},\"mode\":\"{}\",\"impl\":\"{}\",\"ns_per_op\":{:.3},\"mops\":{:.3},\"ops\":{},\"runs\":{},\"samples_ns_per_op\":[{}]}}",
             r.topo,
             r.bytes,
             r.mode,
@@ -943,7 +1014,8 @@ fn print_json(rows: &[Row]) {
             r.ns,
             1000.0 / r.ns,
             r.ops,
-            r.runs
+            r.runs,
+            samples,
         );
     }
 }
