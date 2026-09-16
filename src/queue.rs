@@ -143,7 +143,9 @@ impl Backoff {
 
     /// Like `snooze`, but returns `false` instead of yielding once the spinning
     /// budget is used up, for callers that must not block their thread.
-    #[inline(always)]
+    // Keep this rare wait out of the successful pop/poll path's instruction footprint.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn snooze_bounded(&mut self) -> bool {
         if self.0 >= SNOOZE_LIMIT {
             return false;
