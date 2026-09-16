@@ -6,6 +6,10 @@ tag: "design note"
 draft: false
 ---
 
+Published article: [rapidfire: the channel between a market feed and a decision](https://prod.codes/blog/rapidfire-channel-between-feed-and-decision/).
+This upstream draft retains the original 0.1.0 measurements. Subsequent channel and
+harness changes have a separate [before/after report](../benches/OPTIMIZATION.md).
+
 An exchange publishes an order-book update over a WebSocket. A reader task decrypts the frame,
 parses it, stamps it, and hands it to the strategy thread. The strategy decides, and an order
 goes out. In high-frequency trading that whole chain is the product: whoever reacts to the same
@@ -17,7 +21,7 @@ nanoseconds plus a syscall to wake the consumer is a visible slice of the budget
 own. It is now open source as [rapidfire](https://github.com/alex09x/rapidfire)
 (`rapidfire = "0.1"` on crates.io), and this note is about what it took.
 
-![Where the channel sits: exchange feeds, reader tasks, one channel, one pinned strategy thread, the order gateway](/img/rapidfire/pipeline.svg)
+![Where the channel sits: exchange feeds, reader tasks, one channel, one pinned strategy thread, the order gateway](img/pipeline.svg)
 
 The principles are the usual ones for this kind of code, and all of them are about the hot path
 only. No lock: a lock is a syscall waiting to happen. No allocation per message. No syscall to
@@ -28,43 +32,42 @@ And measure the tail, not the mean, on the machine you actually run on.
 
 ## What the queue looks like
 
-The channel is an intrusive linked list of blocks. Each block holds 63 value slots and a
-64th sentinel slot that says "the next block is installed". Every slot carries a state word
-tagged with the lap number, so a slot reused on the next pass around the pool cannot be
-mistaken for a written one. Three indices live on three separate 128-byte lines: the tail
-(producers), the head (consumers) and the read marks the consumers use to decide when a block
-can be recycled. A producer does one `fetch_add` on the tail, writes the value into its slot,
-and publishes the slot state with a release store; once it has seen contention on the tail it
-switches to a CAS loop, because on four producers a `fetch_add` that always succeeds and then
-has to fix up the block transition was four times slower than a CAS that fails cheaply.
-A consumer reads the slot state first and only then CASes the head, so it never claims a slot
-that is not written yet. Blocks are never freed while the queue is alive: a spare block and a
-small pool are recycled, so a walker that is a few blocks behind never reads freed memory.
-Bounded and unbounded channels share the code; the bounded one adds a capacity check on the
-producer side.
+The channel is an intrusive linked list of blocks. Each block holds 63 value slots; the
+64th index position is a sentinel used during block transitions and holds no value.
+Every slot carries a state word tagged with the lap number, so a slot reused on the next
+pass around the pool cannot be mistaken for a written one.
 
-![Queue layout: a linked list of 63-slot blocks, three cache lines of indices](/img/rapidfire/queue-layout.svg)
+Producer tail and consumer head are separately padded to 128 bytes; each block also keeps
+reader-completion marks in a separately padded header. An uncontended unbounded producer
+reserves a slot with `fetch_add`; under contention this path uses CAS retries with backoff,
+which reduced adjacent-slot contention in our measurements. Bounded senders reserve with a
+capacity check and CAS. After reservation, the producer writes the value and publishes the
+slot state with a release store. A consumer checks that state before CAS-advancing the head,
+so it never claims an unwritten slot. Blocks stay allocated while the channel is live and
+return to a spare slot or pool only after their readers finish. Recycling retains high-water
+memory until the channel is dropped.
 
-The async layer on top is deliberately dumb: a mutex-protected waiter list that is touched
-only when a task has to park. The interesting part is how a parking receiver and a sending
-producer avoid a `SeqCst` fence on the hot path. The side that parks does a `fetch_add(0,
-AcqRel)` on the other side's index, which forces its own flag write and the other side's index
-write into one global order; the sender then only needs a relaxed load of the flag after its
-claim. Every mutation of an index has to be a read-modify-write for this to hold. We learned
-that the hard way when a plain `store` on the head, added for speed, broke the release
-sequence, and the loom model of the bounded channel caught it before production did.
+![Queue layout: linked 63-slot blocks, padded head and tail, per-block read flags](img/queue-layout.svg)
+
+The async layer is a mutex-protected waiter list used for registration and notification.
+After registering, a parking receiver does `fetch_add(0, AcqRel)` on the tail index. Later
+producer claims acquire that release sequence, so a relaxed load after the claim sees the
+registration. If the snapshot includes a claimed but unwritten slot, the receiver polls and
+yields instead of sleeping through its publication. Bounded senders use the corresponding
+protocol on the head index. Every index mutation must be a read-modify-write to preserve the
+release sequence. A plain `store` on the head broke it, and the Loom model caught the bug.
 
 ## What broke on the way
 
-The first release ran fine on a workstation and crashed within minutes on a 128-core
-Neoverse-N1 box: a consumer that had fallen a few blocks behind followed a `prev` link into a
+Pre-release builds ran fine on a workstation and crashed within minutes on a 128-core
+Neoverse-N1 box: a lagging block walker followed a `prev` link into a
 block that had been recycled and had its links cleared. The fix is a rule, not a patch: a
 block's `start` position is published last with a release store, links are never nulled on
 recycle, and a walker validates every block it lands on by its `start`. The second failure was
 a deadlock in the four-by-four MPMC test on the same machine. Consumers claimed a slot first
 and waited for it to be written; under load the head passed an unwritten slot, the blocks
-behind it were recycled, and a producer walking forward to its slot was stranded. Claim-first
-consumers were removed; a parked receiver polls busy slots and yields instead.
+behind it were recycled, and a producer walking backwards from the tail to its slot was
+stranded. Claim-first consumers were removed; a parked receiver polls busy slots and yields instead.
 
 Two bugs came from review rather than from a machine. A delegated review task (we run
 reviews as isolated !prod tasks, so the reviewer starts from the exact commit and can build
@@ -82,9 +85,10 @@ We expected to end up with inline assembly. We did not, and the reason is worth 
 `examples/asm_probe.rs` wraps `try_send` and `try_recv` in never-inlined functions so
 `objdump` shows just the hot path. On Zen 4 an unbounded `try_send` is one `lock xadd` (a
 `lock cmpxchg` once contention has been seen) and about twenty ordinary instructions; on
-AArch64 it is one LSE atomic, `ldapr` loads and a single `stlr`. We wrote three alternative
-publish sequences by hand (`dmb ishst` plus a plain store, `fence(Release)` plus a plain store,
-and an RMW publish) and measured each; all three were slower than the compiler's `stlr`.
+AArch64 it is one LSE atomic, `ldapr` loads and a single `stlr`. We measured three alternative
+publish sequences: inline assembly using `dmb ishst` plus a plain store, a Rust
+`fence(Release)` plus a plain store, and an atomic RMW publish. All three were slower
+than the compiler's `stlr`.
 They stay in the tree behind `--cfg` switches as evidence.
 
 `perf` then explained where the remaining time is. In the single-producer case both rapidfire
@@ -98,34 +102,39 @@ machines are in the `pause` and `isb` back-off loops: contention on two index wo
 no instruction selection fixes. The compiler had not made a mistake anywhere we looked; the
 work left is choosing which cache lines cross cores, and that is a data-layout decision.
 
-![Work per two million messages, SPSC on a Ryzen 9 7950X: instructions and cycles for rapidfire versus SegQueue](/img/rapidfire/perf-instructions.svg)
-
 ## The numbers, and where we lose
 
 The harness compares rapidfire with crossbeam-queue, std mpsc, flume, async-channel and
-tokio's mpsc on the same pinned cores: medians of five runs, one CCD or one NUMA node,
+tokio's mpsc: medians of five runs, with the requested CPU lists recorded in the tables,
 rustc 1.97.1 with `target-cpu=native`, on twelve machines from a Haswell Xeon and a Zen 2
 desktop to Zen 5, a 128-core N1 and an M3 Pro.[^1] The topology we care most about is many
 WebSocket readers feeding one writer, because that is what a market-data collector is.
+The SPSC and collector numbers are amortized elapsed time per message under a stream,
+not the latency of an individual hand-off or an end-to-end trading pipeline.
 
-![One message through the channel, SPSC unbounded, Ryzen 9 7950X](/img/rapidfire/spsc-zen4.svg)
+These are the original 0.1.0 measurements, retained as a historical snapshot. The raw harness
+added a Tokio-only receive mutex and a shared per-message completion counter in MPMC tests,
+and the harnesses started timing after releasing workers. Pin lists assigned only the listed
+workers; additional workers were unpinned. Later corrections to the harness mean the original
+ratios should not be interpreted as measurements from the corrected setup.
 
-![Forty reader tasks feeding one writer on tokio, Ryzen 9 7900, by payload size](/img/rapidfire/collector-async-zen4.svg)
+![Amortized time per message, SPSC unbounded, Ryzen 9 7950X](img/spsc-zen4.svg)
 
-![SPSC speed-up over the best other channel on each of the twelve machines](/img/rapidfire/spsc-ratio-fleet.svg)
+![Forty reader tasks feeding one writer on tokio, Ryzen 9 7900, by payload size](img/collector-async-zen4.svg)
 
 The losses are in the tables too. On the M3 Pro, unpinned, crossbeam's `SegQueue` is 12
 percent faster in the single-producer case and `ArrayQueue` wins the bounded one; Apple's
 cores do not reward the lower instruction count the way Zen does. Many producers hammering a
 small bounded channel that is routinely full spin on the consumer's head line, where
-`ArrayQueue` polls its slot instead. And an oversubscribed eight-producer run with every
-thread spinning is a benchmark of the scheduler, not of the queue. None of these is the shape
-our bots run, and all of them are written down in `benches/RESULTS.md` next to the wins.
+`ArrayQueue` polls its slot instead. A short pin list in an eight-producer run leaves some
+workers unpinned, so placement and scheduling can dominate that comparison. None of these is
+the shape our bots run, and all of them are written down in `benches/RESULTS.md` next to the wins.
 
 The rule we would give anyone doing this: benchmark the topology you run, on the hardware you
 run it on, and let the sampler decide whether assembly is the next step. For us it said no,
 twice.
 
 [^1]: Library versions in the comparison: crossbeam-queue 0.3.14, flume 0.11.1, async-channel
-2.5.0, tokio 1.53.1. The full matrix (bounded and unbounded, SPSC, MPSC 4, 8 and 32 producers,
-MPMC, ping-pong) and the perf profiles are in the repository's `benches/RESULTS.md`.
+    2.5.0, tokio 1.53.1. The full matrix (bounded and unbounded, SPSC, MPSC 4, 8 and 32 producers,
+    MPMC, ping-pong) and the perf profiles are in the
+    [original RESULTS table](https://github.com/alex09x/rapidfire/blob/60966c1512b24e710af2f99d1b3382f10e9e218d/benches/RESULTS.md).
