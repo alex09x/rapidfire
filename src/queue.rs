@@ -461,7 +461,11 @@ impl<T> Queue<T> {
     pub(crate) fn len(&self) -> usize {
         let head = self.head.index.load(Relaxed);
         let tail = self.tail.index.load(Relaxed);
-        items_between(head, tail)
+        // The independent snapshots can span a receive/refill cycle: an old
+        // head paired with a newer tail can look larger than a bounded queue.
+        // Keep this approximate observation within the channel's actual bound.
+        // UNBOUNDED is usize::MAX, so it leaves unbounded estimates unchanged.
+        items_between(head, tail).min(self.capacity)
     }
 
     #[inline]

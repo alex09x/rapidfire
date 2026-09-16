@@ -155,6 +155,7 @@ impl<T> Receiver<T> {
         self.inner.is_closed()
     }
     /// Returns an approximate queued count, including pending publications.
+    /// The result never exceeds a bounded channel's capacity.
     pub fn len(&self) -> usize {
         self.inner.len()
     }

@@ -12,6 +12,8 @@
   capacity publication and sender notification. The general MPMC API is unchanged.
 - Fix a shared send/receive lost-wakeup race: a completing operation could absorb
   a later notification and strand another waiter. Both MPMC and MPSC use the fix.
+- Keep a bounded channel's approximate `len()` within its capacity when concurrent
+  receives and refills occur between its two index observations.
 - Extend correctness coverage for ownership, cancellation, block recycling,
   per-producer FIFO and wakeup races, including compile-fail, Loom and Miri checks.
 - Add MPSC throughput and paced latency comparisons, and include the exclusive
