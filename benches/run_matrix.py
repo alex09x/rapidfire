@@ -59,6 +59,13 @@ def main():
                     "comparison_cpus": comparison_cpus,
                     "placement": "checked affinity" if platform.system() == "Linux" else "QoS only; unpinned",
                     "rustflags": env["RUSTFLAGS"], "commands": []}
+        if platform.system() == "Linux":
+            topology = json.loads(subprocess.check_output(["lscpu", "-J"], text=True))
+            manifest["cpu_topology"] = topology["lscpu"]
+        elif platform.system() == "Darwin":
+            manifest["cpu_model"] = subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
+            manifest["memory_bytes"] = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]))
 
     def save():
         temporary = manifest_file.with_suffix(".tmp")
