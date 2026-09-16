@@ -29,6 +29,13 @@ use std::time::Instant;
 // CPU pinning
 // ============================================================================
 
+// Exiting the benchmark process also stops workers already waiting at a barrier.
+// Panicking in only the worker with a bad pin would strand its peers forever.
+fn pin_error(message: impl std::fmt::Display) -> ! {
+    eprintln!("invalid benchmark CPU placement: {message}");
+    std::process::exit(2);
+}
+
 #[cfg(target_os = "linux")]
 extern "C" {
     fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
@@ -43,15 +50,19 @@ const CPU_SET_WORDS: usize = 16;
 fn pin_to_core(core: usize) {
     let word = core / 64;
     if word >= CPU_SET_WORDS {
-        return;
+        pin_error(format!("CPU ID {core} out of range"));
     }
     let mut mask = [0u64; CPU_SET_WORDS];
     mask[word] = 1u64 << (core % 64);
     // SAFETY: `mask` is a live, properly aligned [u64; 16] of exactly the size we
     // pass as `cpusetsize` (128 bytes = cpu_set_t); pid 0 means "the calling thread".
     // The kernel only reads `cpusetsize` bytes from the pointer.
-    unsafe {
-        sched_setaffinity(0, CPU_SET_WORDS * 8, mask.as_ptr());
+    let ret = unsafe { sched_setaffinity(0, CPU_SET_WORDS * 8, mask.as_ptr()) };
+    if ret != 0 {
+        pin_error(format!(
+            "sched_setaffinity failed for core {core}: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 }
 
@@ -64,8 +75,12 @@ fn pin_to_core(_core: usize) {
     }
     const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
     // SAFETY: plain libc call affecting only the calling thread.
-    unsafe {
-        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    let ret = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+    if ret != 0 {
+        pin_error(format!(
+            "pthread_set_qos_class_self_np failed: {}",
+            std::io::Error::from_raw_os_error(ret)
+        ));
     }
 }
 
@@ -74,8 +89,15 @@ fn pin_to_core(_core: usize) {}
 
 /// Pins the calling thread if a core was configured for worker slot `k`.
 fn pin_worker(pin: &[usize], k: usize) {
-    if let Some(&core) = pin.get(k) {
-        pin_to_core(core);
+    if pin.is_empty() {
+        return;
+    }
+    match pin.get(k) {
+        Some(&core) => pin_to_core(core),
+        None => pin_error(format!(
+            "worker slot {k} not found in nonempty pin list (length {})",
+            pin.len()
+        )),
     }
 }
 
@@ -127,6 +149,37 @@ impl Chan for Fast {
     }
     fn clone_rx(rx: &Self::Rx) -> Option<Self::Rx> {
         Some(rx.clone())
+    }
+    fn try_send(tx: &Self::Tx, v: u64) -> Result<(), u64> {
+        tx.try_send(v).map_err(|e| e.into_inner())
+    }
+    fn try_recv(rx: &mut Self::Rx) -> Option<u64> {
+        rx.try_recv().ok()
+    }
+}
+
+// ----------------------------------------------------------- rapidfire_mpsc
+
+struct FastMpsc;
+
+impl Chan for FastMpsc {
+    type Tx = rapidfire::Sender<u64>;
+    type Rx = rapidfire::mpsc::Receiver<u64>;
+
+    const NAME: &'static str = "rapidfire_mpsc";
+    const MULTI_CONSUMER: bool = false;
+
+    fn unbounded() -> Option<(Self::Tx, Self::Rx)> {
+        Some(rapidfire::mpsc::unbounded())
+    }
+    fn bounded(cap: usize) -> Option<(Self::Tx, Self::Rx)> {
+        Some(rapidfire::mpsc::bounded(cap))
+    }
+    fn clone_tx(tx: &Self::Tx) -> Self::Tx {
+        tx.clone()
+    }
+    fn clone_rx(_rx: &Self::Rx) -> Option<Self::Rx> {
+        None
     }
     fn try_send(tx: &Self::Tx, v: u64) -> Result<(), u64> {
         tx.try_send(v).map_err(|e| e.into_inner())
@@ -749,12 +802,19 @@ fn parse_cfg(args: &[String]) -> Cfg {
         } else if let Some(v) = arg.strip_prefix("--filter=") {
             cfg.filter = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--pin=") {
-            cfg.pin = v
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .filter_map(|s| s.parse::<usize>().ok())
-                .collect();
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                cfg.pin = Vec::new();
+            } else {
+                cfg.pin = trimmed
+                    .split(',')
+                    .map(str::trim)
+                    .map(|s| {
+                        s.parse::<usize>()
+                            .unwrap_or_else(|e| panic!("malformed pin entry '{s}': {e}"))
+                    })
+                    .collect();
+            }
         } else if let Some(v) = arg.strip_prefix("--n=") {
             n_override = v.parse::<usize>().ok();
         }
@@ -776,6 +836,7 @@ struct Row {
     imp: &'static str,
     ns: Option<f64>,
     runs: usize,
+    samples_ns_per_op: Vec<f64>,
 }
 
 type ScenarioFn = fn(usize, &[usize]) -> Option<f64>;
@@ -805,6 +866,7 @@ fn measure(
             imp,
             ns: None,
             runs: 0,
+            samples_ns_per_op: Vec::new(),
         };
     }
     let mut samples = Vec::with_capacity(cfg.runs);
@@ -820,15 +882,18 @@ fn measure(
             imp,
             ns: None,
             runs: 0,
+            samples_ns_per_op: Vec::new(),
         };
     }
     let runs = samples.len();
+    let med = median(samples.clone());
     Row {
         order,
         scenario,
         imp,
-        ns: Some(median(samples)),
+        ns: Some(med),
         runs,
+        samples_ns_per_op: samples,
     }
 }
 
@@ -912,17 +977,24 @@ fn print_table(cfg: &Cfg, rows: &[Row]) {
 
 fn print_json(rows: &[Row]) {
     for r in rows {
+        let samples = r
+            .samples_ns_per_op
+            .iter()
+            .map(|s| format!("{s:.3}"))
+            .collect::<Vec<_>>()
+            .join(",");
         match r.ns {
             Some(ns) => println!(
-                "{{\"scenario\":\"{}\",\"impl\":\"{}\",\"ns_per_op\":{:.3},\"mops\":{:.3},\"runs\":{}}}",
+                "{{\"scenario\":\"{}\",\"impl\":\"{}\",\"ns_per_op\":{:.3},\"mops\":{:.3},\"runs\":{},\"samples_ns_per_op\":[{}]}}",
                 r.scenario,
                 r.imp,
                 ns,
                 1000.0 / ns,
-                r.runs
+                r.runs,
+                samples,
             ),
             None => println!(
-                "{{\"scenario\":\"{}\",\"impl\":\"{}\",\"ns_per_op\":null,\"mops\":null,\"runs\":{}}}",
+                "{{\"scenario\":\"{}\",\"impl\":\"{}\",\"ns_per_op\":null,\"mops\":null,\"runs\":{},\"samples_ns_per_op\":[]}}",
                 r.scenario, r.imp, r.runs
             ),
         }
@@ -935,6 +1007,7 @@ pub fn run(args: &[String]) {
     let mut rows: Vec<Row> = Vec::new();
 
     bench_impl::<Fast>(&cfg, &mut rows);
+    bench_impl::<FastMpsc>(&cfg, &mut rows);
     bench_impl::<CrossbeamSeg>(&cfg, &mut rows);
     bench_impl::<CrossbeamArray>(&cfg, &mut rows);
     bench_impl::<StdMpsc>(&cfg, &mut rows);

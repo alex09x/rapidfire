@@ -66,10 +66,10 @@
 //! Instead the party going to sleep pays: after raising its flag it performs an RMW on
 //! the *other side's* index (`tail.index.fetch_add(0, AcqRel)` for a receiver,
 //! `head.index.fetch_add(0, AcqRel)` for a bounded sender).  Every later claim on that
-//! index is an `AcqRel` CAS that reads from (the release sequence headed by) that RMW,
+//! index is an `AcqRel` RMW that reads from (the release sequence headed by) that RMW,
 //! so it synchronizes-with the sleeper and a plain `Relaxed` load of the flag right after
-//! the CAS is guaranteed to observe it.  This needs every modification of those two
-//! indices to be an RMW (a plain store would end the release sequence), which is why the
+//! the claim is guaranteed to observe it. Every modification of an index used for
+//! parking must be an RMW (a plain store would end the release sequence), which is why the
 //! block transition uses `swap` rather than `store`.  The RMW also returns the live index, so the
 //! sleeper can tell *claims* from *writes*: if a slot below that index is claimed but
 //! not yet written, the producer sampled the flag before the registration and will not
@@ -82,6 +82,16 @@
 //! after `pop` reported empty, the close itself is a `SeqCst` swap, and the final
 //! `Closed` verdict re-checks both indices with `SeqCst`, so a value pushed before the
 //! close is always drained before `Closed` is reported.
+//!
+//! # Exclusive MPSC receive paths
+//!
+//! `pop_single` and `pop_single_batch` require one consumer for the queue's whole
+//! lifetime, enforced by `mpsc::Receiver`'s private wrapper and exclusive borrows.
+//! They read values before advancing head, omit reader marks, and recycle blocks
+//! only after that sole reader has finished. Bounded head updates remain AcqRel
+//! RMWs, including one RMW per batch chunk, to preserve sender wakeup ordering.
+//! Unbounded senders never park on head; only this exclusive unbounded path may
+//! use head stores. Tail updates still preserve the receiver-parking sequence.
 
 use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use crate::sync::{
@@ -451,7 +461,11 @@ impl<T> Queue<T> {
     pub(crate) fn len(&self) -> usize {
         let head = self.head.index.load(Relaxed);
         let tail = self.tail.index.load(Relaxed);
-        items_between(head, tail)
+        // The independent snapshots can span a receive/refill cycle: an old
+        // head paired with a newer tail can look larger than a bounded queue.
+        // Keep this approximate observation within the channel's actual bound.
+        // UNBOUNDED is usize::MAX, so it leaves unbounded estimates unchanged.
+        items_between(head, tail).min(self.capacity)
     }
 
     #[inline]
@@ -839,6 +853,112 @@ impl<T> Queue<T> {
 }
 
 impl<T> Queue<T> {
+    /// Receives with exclusive consumer access for the entire queue lifetime.
+    ///
+    /// # Safety
+    /// No other receive operation may run concurrently, and this queue must never
+    /// use the MPMC pop path: single-reader blocks deliberately have no read marks.
+    #[inline(always)]
+    pub(crate) unsafe fn pop_single(&self, wake_flag: &AtomicUsize) -> Option<(T, bool)> {
+        let head = self.head.index.load(Relaxed);
+        let block = self.head.block.load(Relaxed);
+        let offset = head & OFFSET_MASK;
+        debug_assert!(offset < BLOCK_CAP);
+        let slot = (*block).slots.get_unchecked(offset);
+        if slot.state.load(Acquire) != written_tag(head >> LAP_SHIFT) {
+            return None;
+        }
+        // The only consumer reads the value before releasing capacity. No reader
+        // can retain this block once this operation advances to the next one.
+        let value = slot.value.with(|p| p.read().assume_init());
+        let last = offset + 1 == BLOCK_CAP;
+        if last {
+            let next = (*block).phdr.0.next.load(Acquire);
+            debug_assert!(!next.is_null());
+            self.head.block.store(next, Release);
+        }
+        let advance = if last { 2 } else { 1 };
+        let wake = if self.capacity == UNBOUNDED {
+            // Unbounded senders never park on head, so no release sequence needs
+            // preserving here. Receiver parking still uses the producer tail RMW.
+            self.head.index.store(head + advance, Release);
+            false
+        } else {
+            // Preserve the release sequence established by sender_parking(). A
+            // plain store here would allow lost wakes even with one consumer.
+            self.head.index.fetch_add(advance, AcqRel);
+            wake_flag.load(Relaxed) != 0
+        };
+        if last {
+            self.recycle_single(block);
+        }
+        Some((value, wake))
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn recycle_single(&self, block: *mut Block<T>) {
+        // All values were consumed serially; read marks were never set. Retain
+        // links for stale producer walkers, just as in the MPMC reset path.
+        (*block).phdr.0.start.store(POOLED, Relaxed);
+        self.recycle(block);
+    }
+
+    /// Receives a ready prefix within one block, publishing capacity once.
+    ///
+    /// # Safety
+    /// The same lifetime-wide exclusive-consumer contract as `pop_single` applies.
+    /// The caller must notify the returned number of senders before another call
+    /// which might panic (notably allocation for the next batch).
+    #[inline]
+    pub(crate) unsafe fn pop_single_batch(
+        &self,
+        buffer: &mut Vec<T>,
+        limit: usize,
+        wake_flag: &AtomicUsize,
+    ) -> (usize, usize) {
+        if limit == 0 {
+            return (0, 0);
+        }
+        let head = self.head.index.load(Relaxed);
+        let block = self.head.block.load(Relaxed);
+        let offset = head & OFFSET_MASK;
+        let tag = written_tag(head >> LAP_SHIFT);
+        let max = limit.min(BLOCK_CAP - offset);
+        if (*block).slots.get_unchecked(offset).state.load(Acquire) != tag {
+            return (0, 0);
+        }
+        // Reserve before moving any values: after the first move, nothing may
+        // unwind before head is advanced or Drop would destroy a moved value twice.
+        buffer.reserve(max);
+        let mut count = 0;
+        while count < max {
+            let slot = (*block).slots.get_unchecked(offset + count);
+            if slot.state.load(Acquire) != tag {
+                break;
+            }
+            buffer.push(slot.value.with(|p| p.read().assume_init()));
+            count += 1;
+        }
+        let last = offset + count == BLOCK_CAP;
+        if last {
+            let next = (*block).phdr.0.next.load(Acquire);
+            self.head.block.store(next, Release);
+        }
+        let advance = count + usize::from(last);
+        let wake = if self.capacity == UNBOUNDED {
+            self.head.index.store(head + advance, Release);
+            0
+        } else {
+            self.head.index.fetch_add(advance, AcqRel);
+            wake_flag.load(Relaxed).min(count)
+        };
+        if last {
+            self.recycle_single(block);
+        }
+        (count, wake)
+    }
+
     /// Block transition on the consumer side, run by the consumer that took the last
     /// slot of `block` (position `head`).  Out of line: once per 63 values.
     ///
