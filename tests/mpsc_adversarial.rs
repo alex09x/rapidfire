@@ -526,8 +526,8 @@ fn test_adversarial_concurrent_send_cancellation_and_batch_drain() {
                                 res.unwrap();
                                 true
                             }
-                            futures::future::Either::Right(((), send_fut)) => {
-                                drop(send_fut);
+                            futures::future::Either::Right(((), _pending)) => {
+                                // The underlying Send is cancelled when this async block exits.
                                 false
                             }
                         }
