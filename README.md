@@ -93,6 +93,18 @@ The MPSC comparison separately measures sync 4/8 producers and async 4/40 produc
 64/256/1024-byte messages, bounded capacities 25/4096, unbounded queues, and receive
 limits 1/32. Paced delivery latency records p50, p99 and maximum delay.
 
+Selected results with 1 KiB messages, four Tokio workers and receive limit 32:
+
+| CPU (report machine) | Workload | MPMC, ns/message | MPSC, ns/message | Result |
+|:--|:--|--:|--:|:--|
+| Ryzen 7950X (#3) | 40 producers, bounded(4096) | 249.58 | 57.22 | 4.36× faster |
+| Ryzen 9950X (#8) | 40 producers, bounded(4096) | 155.17 | 49.53 | 3.13× faster |
+| Apple M3 Pro (#12) | 40 producers, bounded(4096) | 82.23 | 72.95 | 1.13× faster |
+| Ryzen 9950X (#8) | 4 producers, unbounded | 46.74 | 245.56 | 5.25× slower |
+
+These are amortized throughput costs, measured on shared machines. The report
+includes every machine, all workloads and separate paced latency measurements.
+
 **MPSC is an opt-in performance tradeoff.** A single receiver avoids arbitration
 between consumers, and batching amortizes capacity updates and sender notifications.
 Producers still contend on a shared tail. Scheduling, queue occupancy and recycling

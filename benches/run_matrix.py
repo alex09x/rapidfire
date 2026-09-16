@@ -44,7 +44,8 @@ def main():
     cargo = ["cargo", "+" + args.toolchain]
     manifest_file = output / "manifest.json"
     hashes = {str(p.relative_to(repo)): hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in sorted(repo.rglob("*.rs")) if "target" not in p.parts and ".git" not in p.parts}
+              for directory in ("src", "tests", "benches", "examples")
+              for p in sorted((repo / directory).rglob("*.rs"))}
     for name in ["Cargo.toml", "Cargo.lock", "benches/run_matrix.py"]:
         hashes[name] = hashlib.sha256((repo / name).read_bytes()).hexdigest()
     if manifest_file.exists():
