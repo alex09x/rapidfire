@@ -604,7 +604,10 @@ impl<T> Sender<T> {
         self.inner.is_closed()
     }
 
-    /// Returns the number of messages currently in the channel.
+    /// Returns an approximate queued count, including pending publications.
+    ///
+    /// Concurrent sends and receives can change the count while it is sampled.
+    /// For a bounded channel the result never exceeds its capacity.
     #[inline]
     pub fn len(&self) -> usize {
         self.inner.queue.len()
@@ -673,7 +676,10 @@ impl<T> Receiver<T> {
         self.inner.is_closed()
     }
 
-    /// Returns the number of messages currently in the channel.
+    /// Returns an approximate queued count, including pending publications.
+    ///
+    /// Concurrent sends and receives can change the count while it is sampled.
+    /// For a bounded channel the result never exceeds its capacity.
     #[inline]
     pub fn len(&self) -> usize {
         self.inner.queue.len()
