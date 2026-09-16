@@ -53,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --release --features loom --test loom
+      - run: cargo test --release --features loom --test loom --test mpsc_loom
 
   miri:
     name: miri (unsafe core)

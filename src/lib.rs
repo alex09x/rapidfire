@@ -257,9 +257,10 @@ impl WaiterList {
     ///
     /// If the entry is gone, a `notify_one` already popped it: that wake-up was meant
     /// to make *someone* consume a value (or a freed slot).  A future that is being
-    /// cancelled (`forward == true`) never will, so the wake-up is passed on to the
-    /// next parked waiter instead of being lost.  A future that completed took its
-    /// value itself and passes nothing on.
+    /// cancelled (`forward == true`) never will, so it passes the wake-up on.
+    /// A poll consumes its previous registration *before* attempting the operation.
+    /// If the register/recheck path succeeds, it also forwards: a notification may
+    /// have arrived after that operation and belong to a later value or free slot.
     #[cold]
     fn unregister(&self, count: &AtomicUsize, id: &mut Option<u64>, forward: bool) {
         if let Some(my) = id.take() {
@@ -715,8 +716,8 @@ pub struct Send<'a, T> {
 }
 
 impl<T> Send<'_, T> {
-    /// `forward`: this future is being cancelled rather than completed, so a wake-up
-    /// it may have absorbed is passed on to the next parked sender.
+    /// Forward on cancellation or a successful registered retry; consume the old
+    /// registration before starting a new attempt.
     #[inline(always)]
     fn unregister(&mut self, forward: bool) {
         if self.waiter_id.is_some() {
@@ -744,16 +745,18 @@ impl<T> Future for Send<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        // Consume the old wake before publishing a value. Otherwise a receive
+        // could notify this stale entry for a *later* free slot, stranding another
+        // sender when this successful poll discards its registration.
+        this.unregister(false);
         let inner = &*this.sender.inner;
         let msg = this.msg.take().expect("Send polled after completion");
 
         let msg = match inner.try_send(msg) {
             Ok(()) => {
-                this.unregister(false);
                 return Poll::Ready(Ok(()));
             }
             Err(TrySendError::Closed(msg)) => {
-                this.unregister(false);
                 return Poll::Ready(Err(SendError(msg)));
             }
             Err(TrySendError::Full(msg)) => msg,
@@ -771,7 +774,9 @@ impl<T> Future for Send<'_, T> {
 
         match inner.try_send(msg) {
             Ok(()) => {
-                this.unregister(false);
+                // A notification received after this send belongs to another
+                // freed slot. Forward conservatively if our entry was notified.
+                this.unregister(true);
                 Poll::Ready(Ok(()))
             }
             Err(TrySendError::Closed(msg)) => {
@@ -793,8 +798,8 @@ pub struct Recv<'a, T> {
 }
 
 impl<T> Recv<'_, T> {
-    /// `forward`: this future is being cancelled rather than completed, so a wake-up
-    /// it may have absorbed is passed on to the next parked receiver.
+    /// See Send::unregister: a completed registered retry may have absorbed a
+    /// notification for a later message, just as a cancelled future may have.
     #[inline(always)]
     fn unregister(&mut self, forward: bool) {
         if self.waiter_id.is_some() {
@@ -819,16 +824,17 @@ impl<T> Future for Recv<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        // Remove the previous registration before consuming: a later push must
+        // not spend its notification on a receive that has already taken a value.
+        this.unregister(false);
         let inner = &*this.receiver.inner;
 
         // Fast path: no lock, no waker.
         match inner.try_recv_nonblocking() {
             Ok(msg) => {
-                this.unregister(false);
                 return Poll::Ready(Ok(msg));
             }
             Err(RecvState::Closed) => {
-                this.unregister(false);
                 return Poll::Ready(Err(RecvError));
             }
             Err(RecvState::Empty) | Err(RecvState::Busy) => {}
@@ -848,7 +854,7 @@ impl<T> Future for Recv<'_, T> {
         loop {
             let busy = match inner.try_recv_nonblocking() {
                 Ok(msg) => {
-                    this.unregister(false);
+                    this.unregister(true);
                     return Poll::Ready(Ok(msg));
                 }
                 Err(RecvState::Closed) => {

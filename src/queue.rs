@@ -82,6 +82,16 @@
 //! after `pop` reported empty, the close itself is a `SeqCst` swap, and the final
 //! `Closed` verdict re-checks both indices with `SeqCst`, so a value pushed before the
 //! close is always drained before `Closed` is reported.
+//!
+//! # Exclusive MPSC receive paths
+//!
+//! `pop_single` and `pop_single_batch` require one consumer for the queue's whole
+//! lifetime, enforced by `mpsc::Receiver`'s private wrapper and exclusive borrows.
+//! They read values before advancing head, omit reader marks, and recycle blocks
+//! only after that sole reader has finished. Bounded head updates remain AcqRel
+//! RMWs, including one RMW per batch chunk, to preserve sender wakeup ordering.
+//! Unbounded senders never park on head; only this exclusive unbounded path may
+//! use head stores. Tail updates still preserve the receiver-parking sequence.
 
 use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use crate::sync::{

@@ -38,8 +38,34 @@ fn mpsc_single_receiver_unbounded_recycles() {
 
 #[test]
 fn mpsc_bounded_two_waiting_senders() {
-    model(|| {
+    // Three actors with parked futures grow the state space rapidly. Keep this
+    // additional model at two preemptions; other queue models use three.
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(2);
+    builder.check(|| {
         let (tx, mut rx) = rapidfire::mpsc::bounded(1);
+        tx.try_send(0).unwrap();
+        let tx2 = tx.clone();
+        let a = thread::spawn(move || block_on(tx.send(1)).unwrap());
+        let b = thread::spawn(move || block_on(tx2.send(2)).unwrap());
+        assert_eq!(block_on(rx.recv()), Ok(0));
+        let mut got = [block_on(rx.recv()).unwrap(), block_on(rx.recv()).unwrap()];
+        got.sort_unstable();
+        assert_eq!(got, [1, 2]);
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(block_on(rx.recv()), Err(RecvError));
+    });
+}
+
+#[test]
+fn general_bounded_two_waiting_senders() {
+    // Three actors with parked futures grow the state space rapidly. Keep this
+    // additional model at two preemptions; other queue models use three.
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(2);
+    builder.check(|| {
+        let (tx, rx) = rapidfire::bounded(1);
         tx.try_send(0).unwrap();
         let tx2 = tx.clone();
         let a = thread::spawn(move || block_on(tx.send(1)).unwrap());
