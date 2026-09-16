@@ -1,0 +1,832 @@
+{
+  "baseline_commit": "cf40507ee1a68a3dbab2ad7d5def8dfc97be6cbe",
+  "candidate_commit": "7b2a867a9eb3f3c8a68f76c4166c203b6cc62096",
+  "platform": "AMD Ryzen 9 7950X, Linux 6.8.0-136-generic, rustc 1.97.1",
+  "build": "release, opt-level=3, fat LTO, codegen-units=1, target-cpu=native; separate target directories",
+  "pin": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "batches": 3,
+  "samples": "Each value is one batch median of 5 runs after a warm-up. Extra workers beyond the pin list are unpinned; single-thread raw rows are unpinned.",
+  "raw_requested_messages": 1000003,
+  "real_requested_messages": 500003,
+  "rows": [
+    {
+      "harness": "raw_bench",
+      "scenario": "st_push_pop",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        5.472,
+        5.748,
+        4.986
+      ],
+      "after_ns": [
+        5.096,
+        6.055,
+        5.279
+      ]
+    },
+    {
+      "harness": "raw_bench",
+      "scenario": "st_burst_1k",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        5.947,
+        6.142,
+        5.535
+      ],
+      "after_ns": [
+        5.57,
+        6.452,
+        5.715
+      ]
+    },
+    {
+      "harness": "raw_bench",
+      "scenario": "spsc",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        5.68,
+        5.446,
+        5.258
+      ],
+      "after_ns": [
+        5.061,
+        5.992,
+        5.223
+      ]
+    },
+    {
+      "harness": "raw_bench",
+      "scenario": "mpsc_4p",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        6.453,
+        6.719,
+        6.323
+      ],
+      "after_ns": [
+        6.594,
+        6.678,
+        6.6
+      ]
+    },
+    {
+      "harness": "raw_bench",
+      "scenario": "mpsc_8p",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        20.318,
+        7.499,
+        22.663
+      ],
+      "after_ns": [
+        25.877,
+        12.104,
+        13.278
+      ]
+    },
+    {
+      "harness": "raw_bench",
+      "scenario": "mpmc_4p4c",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        6.319,
+        6.473,
+        6.026
+      ],
+      "after_ns": [
+        6.164,
+        6.289,
+        6.22
+      ]
+    },
+    {
+      "harness": "raw_bench",
+      "scenario": "pingpong",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        80.67,
+        81.156,
+        77.333
+      ],
+      "after_ns": [
+        77.771,
+        80.618,
+        81.424
+      ]
+    },
+    {
+      "harness": "raw_bench",
+      "scenario": "bounded_spsc_1024",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        6.041,
+        6.718,
+        5.276
+      ],
+      "after_ns": [
+        5.723,
+        6.062,
+        5.729
+      ]
+    },
+    {
+      "harness": "raw_bench",
+      "scenario": "bounded_mpsc_4p_1024",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        7.78,
+        8.065,
+        7.672
+      ],
+      "after_ns": [
+        7.48,
+        8.102,
+        7.624
+      ]
+    },
+    {
+      "harness": "raw_bench",
+      "scenario": "bounded_mpsc_8p_1024",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        10.613,
+        10.99,
+        10.362
+      ],
+      "after_ns": [
+        53.958,
+        11.719,
+        54.05
+      ]
+    },
+    {
+      "harness": "raw_bench",
+      "scenario": "bounded_mpmc_4p4c_1024",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        10.324,
+        9.289,
+        8.488
+      ],
+      "after_ns": [
+        9.058,
+        7.869,
+        9.736
+      ]
+    },
+    {
+      "harness": "raw_bench",
+      "scenario": "mpsc_32p",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        61.661,
+        59.68,
+        67.393
+      ],
+      "after_ns": [
+        55.542,
+        60.594,
+        55.22
+      ]
+    },
+    {
+      "harness": "raw_bench",
+      "scenario": "bounded_mpsc_32p_1024",
+      "mode": null,
+      "payload_bytes": 8,
+      "before_ns": [
+        260.175,
+        260.169,
+        256.514
+      ],
+      "after_ns": [
+        291.805,
+        253.923,
+        228.342
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_bounded4096",
+      "mode": "sync",
+      "payload_bytes": 64,
+      "before_ns": [
+        41.964,
+        44.138,
+        30.205
+      ],
+      "after_ns": [
+        40.05,
+        43.719,
+        40.902
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_bounded4096",
+      "mode": "async",
+      "payload_bytes": 64,
+      "before_ns": [
+        28.237,
+        27.725,
+        26.031
+      ],
+      "after_ns": [
+        26.701,
+        29.046,
+        27.203
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_bounded4096",
+      "mode": "sync",
+      "payload_bytes": 256,
+      "before_ns": [
+        28.492,
+        33.609,
+        33.962
+      ],
+      "after_ns": [
+        34.823,
+        32.36,
+        36.494
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_bounded4096",
+      "mode": "async",
+      "payload_bytes": 256,
+      "before_ns": [
+        43.536,
+        46.817,
+        38.748
+      ],
+      "after_ns": [
+        35.666,
+        39.879,
+        34.159
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_bounded4096",
+      "mode": "sync",
+      "payload_bytes": 1024,
+      "before_ns": [
+        89.364,
+        90.053,
+        88.216
+      ],
+      "after_ns": [
+        88.85,
+        90.162,
+        89.208
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_bounded4096",
+      "mode": "async",
+      "payload_bytes": 1024,
+      "before_ns": [
+        104.152,
+        112.639,
+        111.013
+      ],
+      "after_ns": [
+        100.373,
+        101.187,
+        97.162
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_bounded25",
+      "mode": "sync",
+      "payload_bytes": 64,
+      "before_ns": [
+        48.388,
+        50.95,
+        45.659
+      ],
+      "after_ns": [
+        47.523,
+        50.337,
+        47.978
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_bounded25",
+      "mode": "async",
+      "payload_bytes": 64,
+      "before_ns": [
+        35.381,
+        40.49,
+        33.426
+      ],
+      "after_ns": [
+        32.053,
+        34.767,
+        33.212
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_bounded25",
+      "mode": "sync",
+      "payload_bytes": 256,
+      "before_ns": [
+        51.67,
+        50.422,
+        50.306
+      ],
+      "after_ns": [
+        51.84,
+        52.71,
+        51.417
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_bounded25",
+      "mode": "async",
+      "payload_bytes": 256,
+      "before_ns": [
+        50.804,
+        52.045,
+        47.791
+      ],
+      "after_ns": [
+        47.607,
+        50.048,
+        48.832
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_bounded25",
+      "mode": "sync",
+      "payload_bytes": 1024,
+      "before_ns": [
+        88.713,
+        89.13,
+        87.897
+      ],
+      "after_ns": [
+        88.414,
+        89.643,
+        88.599
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_bounded25",
+      "mode": "async",
+      "payload_bytes": 1024,
+      "before_ns": [
+        131.52,
+        130.58,
+        123.847
+      ],
+      "after_ns": [
+        115.049,
+        121.478,
+        114.658
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_unbounded",
+      "mode": "sync",
+      "payload_bytes": 64,
+      "before_ns": [
+        13.449,
+        13.576,
+        12.243
+      ],
+      "after_ns": [
+        12.141,
+        13.178,
+        12.56
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_unbounded",
+      "mode": "async",
+      "payload_bytes": 64,
+      "before_ns": [
+        47.816,
+        47.187,
+        46.505
+      ],
+      "after_ns": [
+        46.695,
+        48.393,
+        47.756
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_unbounded",
+      "mode": "sync",
+      "payload_bytes": 256,
+      "before_ns": [
+        35.647,
+        34.171,
+        33.232
+      ],
+      "after_ns": [
+        37.082,
+        35.879,
+        36.983
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_unbounded",
+      "mode": "async",
+      "payload_bytes": 256,
+      "before_ns": [
+        120.577,
+        61.575,
+        59.731
+      ],
+      "after_ns": [
+        58.85,
+        59.055,
+        58.744
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_unbounded",
+      "mode": "sync",
+      "payload_bytes": 1024,
+      "before_ns": [
+        90.645,
+        91.002,
+        88.478
+      ],
+      "after_ns": [
+        90.722,
+        92.223,
+        91.03
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "ws_to_bot_spsc_unbounded",
+      "mode": "async",
+      "payload_bytes": 1024,
+      "before_ns": [
+        223.646,
+        225.271,
+        213.382
+      ],
+      "after_ns": [
+        204.916,
+        208.241,
+        198.738
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "two_readers_to_bot_bounded4096",
+      "mode": "sync",
+      "payload_bytes": 64,
+      "before_ns": [
+        39.593,
+        40.661,
+        37.086
+      ],
+      "after_ns": [
+        39.497,
+        39.702,
+        38.538
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "two_readers_to_bot_bounded4096",
+      "mode": "async",
+      "payload_bytes": 64,
+      "before_ns": [
+        22.311,
+        29.986,
+        27.233
+      ],
+      "after_ns": [
+        28.115,
+        29.551,
+        28.449
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "two_readers_to_bot_bounded4096",
+      "mode": "sync",
+      "payload_bytes": 256,
+      "before_ns": [
+        31.801,
+        30.953,
+        34.213
+      ],
+      "after_ns": [
+        35.2,
+        33.739,
+        36.076
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "two_readers_to_bot_bounded4096",
+      "mode": "async",
+      "payload_bytes": 256,
+      "before_ns": [
+        46.085,
+        47.38,
+        44.441
+      ],
+      "after_ns": [
+        44.644,
+        47.457,
+        43.939
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "two_readers_to_bot_bounded4096",
+      "mode": "sync",
+      "payload_bytes": 1024,
+      "before_ns": [
+        88.03,
+        88.132,
+        86.813
+      ],
+      "after_ns": [
+        87.577,
+        88.68,
+        87.815
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "two_readers_to_bot_bounded4096",
+      "mode": "async",
+      "payload_bytes": 1024,
+      "before_ns": [
+        67.144,
+        71.549,
+        72.692
+      ],
+      "after_ns": [
+        79.425,
+        71.598,
+        74.044
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "collector_40_readers_to_writer_unbounded",
+      "mode": "sync",
+      "payload_bytes": 64,
+      "before_ns": [
+        92.401,
+        104.452,
+        127.792
+      ],
+      "after_ns": [
+        113.462,
+        115.462,
+        130.56
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "collector_40_readers_to_writer_unbounded",
+      "mode": "async",
+      "payload_bytes": 64,
+      "before_ns": [
+        53.4,
+        44.6,
+        46.06
+      ],
+      "after_ns": [
+        39.602,
+        35.927,
+        40.095
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "collector_40_readers_to_writer_unbounded",
+      "mode": "sync",
+      "payload_bytes": 256,
+      "before_ns": [
+        147.785,
+        148.893,
+        180.087
+      ],
+      "after_ns": [
+        148.898,
+        166.052,
+        182.281
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "collector_40_readers_to_writer_unbounded",
+      "mode": "async",
+      "payload_bytes": 256,
+      "before_ns": [
+        50.181,
+        39.335,
+        36.962
+      ],
+      "after_ns": [
+        40.218,
+        44.662,
+        41.488
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "collector_40_readers_to_writer_unbounded",
+      "mode": "sync",
+      "payload_bytes": 1024,
+      "before_ns": [
+        241.529,
+        223.967,
+        219.663
+      ],
+      "after_ns": [
+        229.539,
+        242.375,
+        238.918
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "collector_40_readers_to_writer_unbounded",
+      "mode": "async",
+      "payload_bytes": 1024,
+      "before_ns": [
+        130.865,
+        142.188,
+        145.795
+      ],
+      "after_ns": [
+        137.324,
+        112.852,
+        114.496
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "request_response_bounded4096",
+      "mode": "sync",
+      "payload_bytes": 64,
+      "before_ns": [
+        101.96,
+        105.091,
+        101.144
+      ],
+      "after_ns": [
+        100.563,
+        102.647,
+        99.968
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "request_response_bounded4096",
+      "mode": "async",
+      "payload_bytes": 64,
+      "before_ns": [
+        205.733,
+        212.731,
+        195.496
+      ],
+      "after_ns": [
+        196.135,
+        204.579,
+        193.049
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "request_response_bounded4096",
+      "mode": "sync",
+      "payload_bytes": 256,
+      "before_ns": [
+        127.005,
+        129.455,
+        139.678
+      ],
+      "after_ns": [
+        128.555,
+        128.91,
+        128.406
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "request_response_bounded4096",
+      "mode": "async",
+      "payload_bytes": 256,
+      "before_ns": [
+        285.382,
+        291.677,
+        270.804
+      ],
+      "after_ns": [
+        223.827,
+        237.104,
+        223.149
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "request_response_bounded4096",
+      "mode": "sync",
+      "payload_bytes": 1024,
+      "before_ns": [
+        246.085,
+        250.232,
+        247.314
+      ],
+      "after_ns": [
+        252.987,
+        255.73,
+        255.537
+      ]
+    },
+    {
+      "harness": "real_case",
+      "scenario": "request_response_bounded4096",
+      "mode": "async",
+      "payload_bytes": 1024,
+      "before_ns": [
+        405.604,
+        413.697,
+        398.926
+      ],
+      "after_ns": [
+        406.548,
+        415.501,
+        399.935
+      ]
+    }
+  ],
+  "controlled_8p_followup": {
+    "scenario": "bounded_mpsc_8p_1024",
+    "pin": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "requested_messages": 1000003,
+    "runs_per_batch": 5,
+    "before_ns": [
+      57.508,
+      59.84,
+      60.382
+    ],
+    "after_ns": [
+      59.745,
+      59.778,
+      58.91
+    ]
+  }
+}

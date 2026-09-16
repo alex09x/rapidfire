@@ -1,5 +1,8 @@
 # Benchmark results (rapidfire 0.1.0)
 
+For the subsequent channel changes, see the separate [optimization check](OPTIMIZATION.md)
+with before/after samples from the corrected harness.
+
 All numbers were produced by the harnesses in this directory on the machines listed
 below: `raw_bench.rs` (`u64` payloads, 4 M messages per run, median of 5 runs after a
 warm-up) and `real_case.rs` (trading-bot topologies). Threads are pinned to the cores
@@ -12,8 +15,9 @@ Toolchain and library versions: rustc 1.97.1 (8bab26f4f 2026-07-14), `-C target-
 `std::sync::mpsc` of the same toolchain.
 
 Two machines were busy with production work during the runs (marked "loaded box"); their
-numbers are indicative only. The 8→1 scenarios run nine threads on eight (or six) pinned
-cores and are therefore oversubscribed on every machine; see the notes below.
+numbers are indicative only. A pin list assigns cores to the first listed workers;
+additional workers remain unpinned. In particular, eight entries do not constrain all
+nine threads in an 8→1 scenario to those eight cores; see the notes below.
 
 ## Raw harness (`raw_bench.rs`)
 
@@ -284,11 +288,10 @@ Notes on the raw harness:
   are preserved and have not been remeasured with the corrected harness.
 - `std mpsc` and `tokio mpsc` have a single receiver, so MPMC is n/a for them; the
   `ArrayQueue` rows only exist for the bounded scenarios; `SegQueue` is unbounded only.
-- MPSC 8→1 is oversubscribed (nine threads on eight or six pinned cores). rapidfire's
-  consumer never waits on a producer: when a producer is pre-empted mid-push the consumer
-  returns `Empty` and the benchmark spins without yielding, while `SegQueue`'s consumer
-  claims the slot and its wait loop yields the CPU to the pre-empted producer. With one
-  core per thread (12 cores on the Ryzen 9 7900) the two tie at ≈27 ns.
+- MPSC 8→1 needs nine pin entries to assign every worker a core. With the shorter
+  lists above, extra workers are unpinned and placement can change across runs. The
+  earlier explanation attributing those cells solely to oversubscription was not
+  established by the harness. Supply one entry per worker for controlled placement.
 - In the bounded multi-producer scenarios a producer that finds the queue full spins on
   `try_send`; every retry re-reads the consumer's head index, which costs the consumer a
   cache-line transfer per pop. `ArrayQueue` (a Vyukov ring) polls the slot instead of the

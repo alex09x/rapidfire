@@ -44,6 +44,8 @@ These tables preserve the original 0.1.0 measurements. The current harness remov
 Tokio-only receiver mutex and the MPMC per-message completion counter, and starts timing
 before releasing workers. See the methodology note in `benches/RESULTS.md`; use the current
 harness for new comparisons rather than treating the historical ratios as corrected runs.
+The subsequent channel changes have a separate [before/after report](benches/OPTIMIZATION.md),
+including the scenarios that became slower and the limits of the CPU placement setup.
 
 Toolchain and library versions: rustc 1.97.1 (8bab26f4f 2026-07-14), `-C target-cpu=native`,
 `lto = "fat"`, `codegen-units = 1`; compared against crossbeam-queue 0.3.14 (`SegQueue`,
