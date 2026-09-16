@@ -94,7 +94,19 @@ fn pin(slot: usize) {
             "affinity failed"
         );
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    unsafe {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        let _ = cpu; // macOS has no CPU affinity API; request QoS only.
+        assert_eq!(
+            pthread_set_qos_class_self_np(0x21, 0),
+            0,
+            "QoS request failed"
+        );
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = cpu;
     }

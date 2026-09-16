@@ -1,8 +1,9 @@
 [package]
 name = "rapidfire"
-version = "0.1.0"
+authors = ["alex09x <alex@prod.codes>"]
+version = "0.2.0"
 edition = "2021"
-description = "Lock-free, zero-dependency async MPMC channel for Rust, built for latency-critical pipelines"
+description = "Zero-dependency async MPMC and MPSC channels with a lock-free queue and receive batching"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alex09x/rapidfire"
 readme = "README.md"
