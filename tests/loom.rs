@@ -98,6 +98,29 @@ fn two_consumers_take_each_value_once() {
 }
 
 #[test]
+fn overlapping_consumers_recycle_blocks_without_losing_values() {
+    model(|| {
+        let (tx, rx) = unbounded::<usize>();
+        for i in 0..4 {
+            tx.try_send(i).unwrap();
+        }
+        let rx2 = rx.clone();
+        let other =
+            thread::spawn(move || [block_on(rx2.recv()).unwrap(), block_on(rx2.recv()).unwrap()]);
+        let mut got = vec![block_on(rx.recv()).unwrap(), block_on(rx.recv()).unwrap()];
+        // The second block transition may reclaim a block retired by the other
+        // reader, or leave it alone if that reader has not finished its value copy.
+        tx.try_send(4).unwrap();
+        tx.try_send(5).unwrap();
+        got.push(block_on(rx.recv()).unwrap());
+        got.push(block_on(rx.recv()).unwrap());
+        got.extend(other.join().unwrap());
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2, 3, 4, 5]);
+    });
+}
+
+#[test]
 fn async_recv_is_woken_by_send() {
     model(|| {
         let (tx, rx) = unbounded::<usize>();
