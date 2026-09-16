@@ -255,7 +255,7 @@ impl WaiterList {
 
     /// Removes `id`'s entry if it is still parked.
     ///
-    /// If the entry is gone, a `notify_one` already popped it: that wake-up was meant
+    /// If the entry is gone, a notification already popped it: that wake-up was meant
     /// to make *someone* consume a value (or a freed slot).  A future that is being
     /// cancelled (`forward == true`) never will, so it passes the wake-up on.
     /// A poll consumes its previous registration *before* attempting the operation.

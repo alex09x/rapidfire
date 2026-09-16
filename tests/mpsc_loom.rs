@@ -5,8 +5,7 @@ use loom::thread;
 use rapidfire::mpsc;
 use rapidfire::RecvError;
 use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Context;
 
 fn model<F: Fn() + Sync + Send + 'static>(f: F) {
     let mut builder = loom::model::Builder::new();
@@ -14,76 +13,29 @@ fn model<F: Fn() + Sync + Send + 'static>(f: F) {
     builder.check(f);
 }
 
-/// A future that yields `Poll::Pending` once while waking itself,
-/// then yields `Poll::Ready(())` on the second poll.
-struct YieldOnce(bool);
-
-impl Future for YieldOnce {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.0 {
-            Poll::Ready(())
-        } else {
-            self.0 = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-}
-
-/// Model 1: Bounded batch capacity release with concurrent send cancellation.
-///
-/// Exercises pop_single_batch releasing capacity for waiting senders, where a
-/// woken sender drops its send future (cancelling it) and forwards its wakeup
-/// to another parked sender without deadlock, data loss, or capacity leak.
+/// A notified sender is cancelled after a batch frees capacity. Another
+/// sender must receive the forwarded notification or observe the free slot.
 #[test]
 fn mpsc_loom_batch_capacity_release_cancellation() {
     model(|| {
         let (tx, mut rx) = mpsc::bounded(1);
         tx.try_send(0).unwrap();
-
-        let tx1 = tx.clone();
-        let h1 = thread::spawn(move || {
-            block_on(async {
-                let send_fut = tx1.send(1);
-                futures::pin_mut!(send_fut);
-                let cancel_fut = YieldOnce(false);
-                futures::pin_mut!(cancel_fut);
-                match futures::future::select(send_fut, cancel_fut).await {
-                    futures::future::Either::Left((res, _)) => {
-                        assert!(res.is_ok());
-                        true
-                    }
-                    futures::future::Either::Right(((), _pending)) => {
-                        // The underlying Send is cancelled when this async block exits.
-                        false
-                    }
-                }
-            })
-        });
-
+        let waker = futures::task::noop_waker();
+        let mut cancelled = Box::pin(tx.send(1));
+        assert!(cancelled
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
         let tx2 = tx.clone();
-        let h2 = thread::spawn(move || {
-            block_on(tx2.send(2)).unwrap();
-        });
-
+        let sender = thread::spawn(move || block_on(tx2.send(2)).unwrap());
         let mut got = Vec::new();
         assert_eq!(block_on(rx.recv_many(&mut got, 1)), Ok(1));
-        assert_eq!(got[0], 0);
-
+        assert_eq!(got, [0]);
+        drop(cancelled);
         drop(tx);
-        while let Ok(value) = block_on(rx.recv()) {
-            got.push(value);
-        }
-        let s1_completed = h1.join().unwrap();
-        h2.join().unwrap();
-        got.sort_unstable();
-
-        if s1_completed {
-            assert_eq!(got, vec![0, 1, 2]);
-        } else {
-            assert_eq!(got, vec![0, 2]);
-        }
+        assert_eq!(block_on(rx.recv()), Ok(2));
+        sender.join().unwrap();
+        assert_eq!(block_on(rx.recv()), Err(RecvError));
     });
 }
 

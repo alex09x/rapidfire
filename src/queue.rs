@@ -66,10 +66,10 @@
 //! Instead the party going to sleep pays: after raising its flag it performs an RMW on
 //! the *other side's* index (`tail.index.fetch_add(0, AcqRel)` for a receiver,
 //! `head.index.fetch_add(0, AcqRel)` for a bounded sender).  Every later claim on that
-//! index is an `AcqRel` CAS that reads from (the release sequence headed by) that RMW,
+//! index is an `AcqRel` RMW that reads from (the release sequence headed by) that RMW,
 //! so it synchronizes-with the sleeper and a plain `Relaxed` load of the flag right after
-//! the CAS is guaranteed to observe it.  This needs every modification of those two
-//! indices to be an RMW (a plain store would end the release sequence), which is why the
+//! the claim is guaranteed to observe it. Every modification of an index used for
+//! parking must be an RMW (a plain store would end the release sequence), which is why the
 //! block transition uses `swap` rather than `store`.  The RMW also returns the live index, so the
 //! sleeper can tell *claims* from *writes*: if a slot below that index is claimed but
 //! not yet written, the producer sampled the flag before the registration and will not
