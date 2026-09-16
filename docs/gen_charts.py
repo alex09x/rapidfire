@@ -120,7 +120,7 @@ s.append(arrow(460, 140, 500, 140))
 s.append(box(500, 110, 140, 60, "strategy loop", "one pinned thread"))
 s.append(arrow(640, 140, 670, 140))
 s.append(box(670, 110, 80, 60, "orders", "gateway"))
-s.append(para(20, 250, "Budget: exchange to decision is tens of microseconds end to end, most of it network and parsing. The hop through the channel is one of the few pieces fully under our control: about 5 ns per message on Zen 4 in the one-reader case, no lock and no syscall on the hot path, and the same code when forty readers feed one consumer.", 100))
+s.append(para(20, 250, "The channel benchmark models the hand-off between reader tasks and a strategy loop. Its ns/message figures are amortized elapsed time under a stream, excluding live network traffic and parsing. They do not measure the latency of one hand-off or the full trading pipeline.", 100))
 s.append("</svg>")
 open(os.path.join(OUT, "pipeline.svg"), "w").write("\n".join(s))
 
@@ -129,15 +129,15 @@ W, H = 760, 420
 s = [f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {W} {H}' width='{W}' height='{H}' {FONT} font-size='12'>",
      f"<defs><marker id='a' markerWidth='8' markerHeight='8' refX='7' refY='4' orient='auto'><path d='M0,0 L8,4 L0,8 z' fill='{INK}'/></marker></defs>",
      f"<rect width='{W}' height='{H}' fill='white'/>",
-     f"<text x='16' y='24' font-size='15' font-weight='bold' fill='{INK}'>Queue layout: a linked list of 63-slot blocks, three cache lines of indices</text>"]
+     f"<text x='16' y='24' font-size='15' font-weight='bold' fill='{INK}'>Queue layout: linked 63-slot blocks and padded metadata</text>"]
 s.append(box(20, 56, 170, 44, "tail", "producers: index, block", fill="#f6f8fa"))
 s.append(box(20, 126, 170, 44, "head", "consumers: index, block", fill="#f6f8fa"))
-s.append(box(20, 196, 170, 44, "read marks", "consumer-owned counters", fill="#f6f8fa"))
+s.append(box(20, 196, 170, 44, "read marks", "per-block read flags", fill="#f6f8fa"))
 for b in range(2):
     x = 240 + b * 260
     s.append(f"<rect x='{x}' y='56' width='230' height='150' rx='6' fill='white' stroke='{INK}' stroke-width='1.5'/>")
     s.append(f"<text x='{x+10}' y='76' fill='{INK}' font-weight='bold'>block {b}</text>")
-    s.append(f"<text x='{x+80}' y='76' fill='{MUTED}' font-size='11'>{'start = 0, in use' if b == 0 else 'start = 64, spare'}</text>")
+    s.append(f"<text x='{x+80}' y='76' fill='{MUTED}' font-size='11'>{'start = 0, in use' if b == 0 else 'start = 64, linked'}</text>")
     for i in range(7):
         sx = x + 10 + i * 30
         fill = "#fdecea" if (b == 0 and i < 6) else "white"
@@ -145,15 +145,15 @@ for b in range(2):
     s.append(f"<text x='{x+10}' y='134' fill='{MUTED}' font-size='11'>… 63 value slots, each with a</text>")
     s.append(f"<text x='{x+10}' y='148' fill='{MUTED}' font-size='11'>lap-tagged state word</text>")
     s.append(f"<rect x='{x+10}' y='160' width='26' height='26' fill='#e6f0ff' stroke='{INK}'/>")
-    s.append(f"<text x='{x+44}' y='172' fill='{MUTED}' font-size='11'>slot 63 is the sentinel:</text>")
-    s.append(f"<text x='{x+44}' y='185' fill='{MUTED}' font-size='11'>'the next block is installed'</text>")
+    s.append(f"<text x='{x+44}' y='172' fill='{MUTED}' font-size='11'>index 63 is the sentinel:</text>")
+    s.append(f"<text x='{x+44}' y='185' fill='{MUTED}' font-size='11'>transition, no value</text>")
 s.append(arrow(470, 130, 500, 130))
 s.append(arrow(190, 78, 240, 78))
 s.append(arrow(190, 148, 240, 148))
-s.append(f"<text x='240' y='232' fill='{INK}'>written slot</text><rect x='325' y='221' width='14' height='14' fill='#fdecea' stroke='{INK}'/>")
-s.append(f"<text x='360' y='232' fill='{INK}'>empty slot</text><rect x='434' y='221' width='14' height='14' fill='white' stroke='{INK}'/>")
-s.append(f"<text x='470' y='232' fill='{INK}'>sentinel</text><rect x='530' y='221' width='14' height='14' fill='#e6f0ff' stroke='{INK}'/>")
-s.append(para(20, 268, "Each index lives on its own 128-byte line, so a producer never touches the consumers' line on the fast path and vice versa. Producer: one fetch_add on the tail index (a CAS once contention has been seen), write the value, publish the slot state with a release store. Consumer: read the slot state first, then CAS the head index; it never claims a slot that is not written yet. Blocks are never freed while the queue is alive: a spare block and a small pool are recycled, so a slow walker never reads freed memory.", 100))
+s.append(f"<rect x='240' y='221' width='14' height='14' fill='#fdecea' stroke='{INK}'/><text x='262' y='232' fill='{INK}'>written</text>")
+s.append(f"<rect x='360' y='221' width='14' height='14' fill='white' stroke='{INK}'/><text x='382' y='232' fill='{INK}'>empty</text>")
+s.append(f"<rect x='470' y='221' width='14' height='14' fill='#e6f0ff' stroke='{INK}'/><text x='492' y='232' fill='{INK}'>sentinel</text>")
+s.append(para(20, 268, "Head and tail are separately padded to 128 bytes. Each block has a separately padded header of read flags; these flags are not another queue index. Unbounded claims use fetch_add or CAS retries; bounded claims check capacity and use CAS. Consumers check slot state before claiming. Finished blocks return to a spare slot or pool outside the live chain and stay allocated until the channel is dropped.", 100))
 s.append("</svg>")
 open(os.path.join(OUT, "queue-layout.svg"), "w").write("\n".join(s))
 print("ok", sorted(os.listdir(OUT)))

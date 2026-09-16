@@ -16,7 +16,9 @@
 //!   measured on Zen 4 and Neoverse-N1, `fetch_add` lets four producers claim four
 //!   adjacent slots at once and then fight over the same slot cache line while
 //!   writing, which stalls the consumer on the slowest of them (~4x worse), whereas
-//!   CAS contention serialises the claims so each write lands before the next claim.
+//!   CAS retries with backoff reduced overlapping adjacent-slot writes in those runs.
+//!   This is a performance observation, not a guarantee that writers run serially:
+//!   a producer can still be paused after claiming its slot and before publishing it.
 //!   Both protocols are correct together, so the mode can flip at any moment and the
 //!   mode word is only a hint.  The block for a claimed position
 //!   is found by walking *backwards* from `tail.block` over `prev` links, comparing
