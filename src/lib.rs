@@ -51,6 +51,8 @@
 mod queue;
 mod sync;
 
+pub mod mpsc;
+
 use crate::queue::{Backoff, Queue};
 use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use crate::sync::{Arc, AtomicBool, AtomicU64, AtomicUsize, CachePadded, Mutex, MutexGuard};
@@ -306,6 +308,29 @@ impl WaiterList {
             let mut list = self.lock();
             count.store(0, SeqCst);
             list.drain(..).map(|(_, waker)| waker).collect()
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// Wakes up to `limit` senders after an exclusive receive batch frees slots.
+    #[cold]
+    fn notify_many(&self, count: &AtomicUsize, limit: usize) {
+        if limit == 1 {
+            self.notify_one(count);
+            return;
+        }
+        let wakers: Vec<Waker> = {
+            let mut list = self.lock();
+            let n = limit.min(list.len());
+            // Allocate before removing entries or decrementing their count.
+            let mut wakers = Vec::with_capacity(n);
+            for _ in 0..n {
+                wakers.push(list.pop_front().unwrap().1);
+            }
+            count.fetch_sub(n, SeqCst);
+            wakers
         };
         for waker in wakers {
             waker.wake();

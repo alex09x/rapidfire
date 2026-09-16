@@ -839,6 +839,112 @@ impl<T> Queue<T> {
 }
 
 impl<T> Queue<T> {
+    /// Receives with exclusive consumer access for the entire queue lifetime.
+    ///
+    /// # Safety
+    /// No other receive operation may run concurrently, and this queue must never
+    /// use the MPMC pop path: single-reader blocks deliberately have no read marks.
+    #[inline(always)]
+    pub(crate) unsafe fn pop_single(&self, wake_flag: &AtomicUsize) -> Option<(T, bool)> {
+        let head = self.head.index.load(Relaxed);
+        let block = self.head.block.load(Relaxed);
+        let offset = head & OFFSET_MASK;
+        debug_assert!(offset < BLOCK_CAP);
+        let slot = (*block).slots.get_unchecked(offset);
+        if slot.state.load(Acquire) != written_tag(head >> LAP_SHIFT) {
+            return None;
+        }
+        // The only consumer reads the value before releasing capacity. No reader
+        // can retain this block once this operation advances to the next one.
+        let value = slot.value.with(|p| p.read().assume_init());
+        let last = offset + 1 == BLOCK_CAP;
+        if last {
+            let next = (*block).phdr.0.next.load(Acquire);
+            debug_assert!(!next.is_null());
+            self.head.block.store(next, Release);
+        }
+        let advance = if last { 2 } else { 1 };
+        let wake = if self.capacity == UNBOUNDED {
+            // Unbounded senders never park on head, so no release sequence needs
+            // preserving here. Receiver parking still uses the producer tail RMW.
+            self.head.index.store(head + advance, Release);
+            false
+        } else {
+            // Preserve the release sequence established by sender_parking(). A
+            // plain store here would allow lost wakes even with one consumer.
+            self.head.index.fetch_add(advance, AcqRel);
+            wake_flag.load(Relaxed) != 0
+        };
+        if last {
+            self.recycle_single(block);
+        }
+        Some((value, wake))
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn recycle_single(&self, block: *mut Block<T>) {
+        // All values were consumed serially; read marks were never set. Retain
+        // links for stale producer walkers, just as in the MPMC reset path.
+        (*block).phdr.0.start.store(POOLED, Relaxed);
+        self.recycle(block);
+    }
+
+    /// Receives a ready prefix within one block, publishing capacity once.
+    ///
+    /// # Safety
+    /// The same lifetime-wide exclusive-consumer contract as `pop_single` applies.
+    /// The caller must notify the returned number of senders before another call
+    /// which might panic (notably allocation for the next batch).
+    #[inline]
+    pub(crate) unsafe fn pop_single_batch(
+        &self,
+        buffer: &mut Vec<T>,
+        limit: usize,
+        wake_flag: &AtomicUsize,
+    ) -> (usize, usize) {
+        if limit == 0 {
+            return (0, 0);
+        }
+        let head = self.head.index.load(Relaxed);
+        let block = self.head.block.load(Relaxed);
+        let offset = head & OFFSET_MASK;
+        let tag = written_tag(head >> LAP_SHIFT);
+        let max = limit.min(BLOCK_CAP - offset);
+        if (*block).slots.get_unchecked(offset).state.load(Acquire) != tag {
+            return (0, 0);
+        }
+        // Reserve before moving any values: after the first move, nothing may
+        // unwind before head is advanced or Drop would destroy a moved value twice.
+        buffer.reserve(max);
+        let mut count = 0;
+        while count < max {
+            let slot = (*block).slots.get_unchecked(offset + count);
+            if slot.state.load(Acquire) != tag {
+                break;
+            }
+            buffer.push(slot.value.with(|p| p.read().assume_init()));
+            count += 1;
+        }
+        let last = offset + count == BLOCK_CAP;
+        if last {
+            let next = (*block).phdr.0.next.load(Acquire);
+            self.head.block.store(next, Release);
+        }
+        let advance = count + usize::from(last);
+        let wake = if self.capacity == UNBOUNDED {
+            self.head.index.store(head + advance, Release);
+            0
+        } else {
+            self.head.index.fetch_add(advance, AcqRel);
+            wake_flag.load(Relaxed).min(count)
+        };
+        if last {
+            self.recycle_single(block);
+        }
+        (count, wake)
+    }
+
     /// Block transition on the consumer side, run by the consumer that took the last
     /// slot of `block` (position `head`).  Out of line: once per 63 values.
     ///
