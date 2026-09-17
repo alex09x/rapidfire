@@ -11,7 +11,7 @@
 //! covers a newly appended page. The queue's parking RMW/recheck protocol
 //! separately covers ordinary send/receive notifications.
 
-use crate::sync::Ordering::{AcqRel, Relaxed, SeqCst};
+use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use crate::sync::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, UnsafeCell};
 use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
@@ -72,13 +72,15 @@ impl Drop for Slot {
 }
 
 struct Page {
+    index: usize,
     slots: [Slot; PAGE_SLOTS],
     next: AtomicPtr<Page>,
 }
 
 impl Page {
-    fn new() -> Self {
+    fn new(index: usize) -> Self {
         Self {
+            index,
             slots: std::array::from_fn(|_| Slot::new()),
             next: AtomicPtr::new(ptr::null_mut()),
         }
@@ -94,7 +96,7 @@ impl Page {
         if let Some(next) = self.next() {
             return next;
         }
-        let new = Box::into_raw(Box::new(Page::new()));
+        let new = Box::into_raw(Box::new(Page::new(self.index + 1)));
         let next = match self
             .next
             .compare_exchange(ptr::null_mut(), new, SeqCst, SeqCst)
@@ -118,9 +120,45 @@ pub(crate) struct WaiterToken {
     ticket: u64,
 }
 
+// Page and slot are independent hints, so racing updates can mix them. Every
+// combination still names a valid slot. Null always names the embedded page,
+// keeping these hints valid when a privately owned list is moved.
+struct Cursor {
+    page: AtomicPtr<Page>,
+    slot: AtomicUsize,
+}
+impl Cursor {
+    fn new() -> Self {
+        Self {
+            page: AtomicPtr::new(ptr::null_mut()),
+            slot: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Position<'a> {
+    page: &'a Page,
+    slot: usize,
+}
+impl<'a> Position<'a> {
+    fn advance(&mut self, first: &'a Page) {
+        self.slot += 1;
+        if self.slot == PAGE_SLOTS {
+            self.slot = 0;
+            self.page = self.page.next().unwrap_or(first);
+        }
+    }
+    fn same(&self, other: Self) -> bool {
+        ptr::eq(self.page, other.page) && self.slot == other.slot
+    }
+}
+
 pub(crate) struct WaiterList {
     first: Page,
     closing: AtomicBool,
+    register_cursor: Cursor,
+    notify_cursor: Cursor,
 }
 
 /// Exclusive ownership of a waker removed from the set of selectable waiters.
@@ -151,9 +189,35 @@ impl Notification<'_> {
 impl WaiterList {
     pub(crate) fn new() -> Self {
         Self {
-            first: Page::new(),
+            first: Page::new(0),
             closing: AtomicBool::new(false),
+            register_cursor: Cursor::new(),
+            notify_cursor: Cursor::new(),
         }
+    }
+
+    fn position<'a>(&'a self, cursor: &Cursor) -> Position<'a> {
+        let page = cursor.page.load(Acquire);
+        // SAFETY: a non-null hint is an appended page, retained until list Drop.
+        let page = if page.is_null() {
+            &self.first
+        } else {
+            unsafe { &*page }
+        };
+        Position {
+            page,
+            slot: cursor.slot.load(Relaxed) % PAGE_SLOTS,
+        }
+    }
+
+    fn save_position(&self, cursor: &Cursor, position: Position<'_>) {
+        let page = if ptr::eq(position.page, &self.first) {
+            ptr::null_mut()
+        } else {
+            position.page as *const Page as *mut Page
+        };
+        cursor.page.store(page, Release);
+        cursor.slot.store(position.slot, Relaxed);
     }
 
     #[cold]
@@ -170,16 +234,22 @@ impl WaiterList {
         // slot. No allocation or user callback occurs between claiming/publishing.
         let waker = waker.clone();
         let ticket = next_id.fetch_add(1, Relaxed).wrapping_shl(3);
-        let mut page = &self.first;
-        let mut offset = 0;
+        let mut position = self.position(&self.register_cursor);
         loop {
-            for (index, slot) in page.slots.iter().enumerate() {
-                let index = NonZeroUsize::new(offset + index + 1).unwrap();
-                if slot
-                    .state
-                    .compare_exchange(FREE, ticket | WRITING, SeqCst, SeqCst)
-                    .is_ok()
+            let start = position;
+            let mut tail = &self.first;
+            loop {
+                let slot = &position.page.slots[position.slot];
+                let index = NonZeroUsize::new(position.page.index * PAGE_SLOTS + position.slot + 1)
+                    .unwrap();
+                if slot.state.load(Relaxed) == FREE
+                    && slot
+                        .state
+                        .compare_exchange(FREE, ticket | WRITING, SeqCst, SeqCst)
+                        .is_ok()
                 {
+                    position.advance(&self.first);
+                    self.save_position(&self.register_cursor, position);
                     // SAFETY: FREE -> WRITING grants exclusive access to this slot.
                     slot.waker.with_mut(|p| unsafe {
                         (*p).write(waker);
@@ -196,9 +266,20 @@ impl WaiterList {
                     });
                     return;
                 }
+                if position.slot + 1 == PAGE_SLOTS && position.page.next().is_none() {
+                    tail = position.page;
+                }
+                position.advance(&self.first);
+                if position.same(start) {
+                    break;
+                }
             }
-            page = page.next_or_append();
-            offset += PAGE_SLOTS;
+            // Only grow after a full cycle found no free slot. A racing appender
+            // may already have supplied the next page; next_or_append adopts it.
+            position = Position {
+                page: tail.next_or_append(),
+                slot: 0,
+            };
         }
     }
 
@@ -270,36 +351,31 @@ impl WaiterList {
     }
 
     fn claim(&self) -> Option<Notification<'_>> {
+        let mut position = self.position(&self.notify_cursor);
+        let start = position;
         loop {
-            let mut oldest: Option<(&Slot, u64)> = None;
-            let mut page = &self.first;
-            loop {
-                for slot in &page.slots {
-                    let state = slot.state.load(SeqCst);
-                    if state & STATE_MASK == WAITING && oldest.is_none_or(|(_, old)| state < old) {
-                        oldest = Some((slot, state));
-                    }
-                }
-                match page.next() {
-                    Some(next) => page = next,
-                    None => break,
-                }
-            }
-            let (slot, state) = oldest?;
+            let slot = &position.page.slots[position.slot];
+            let state = slot.state.load(SeqCst);
             let ticket = state & !STATE_MASK;
-            if slot
-                .state
-                .compare_exchange(state, ticket | NOTIFYING, SeqCst, SeqCst)
-                .is_ok()
+            if state & STATE_MASK == WAITING
+                && slot
+                    .state
+                    .compare_exchange(state, ticket | NOTIFYING, SeqCst, SeqCst)
+                    .is_ok()
             {
+                position.advance(&self.first);
+                self.save_position(&self.notify_cursor, position);
                 return Some(Notification { slot, ticket });
             }
-            // A cancellation or another notifier made progress; retry selection.
+            position.advance(&self.first);
+            if position.same(start) {
+                return None;
+            }
         }
     }
 
-    /// Selects the oldest visible ticket. Ticket wrap affects ordering only:
-    /// payload ownership comes from the CAS, never from the numeric comparison.
+    /// Rotates through the available slots. Concurrent registrations/notifications
+    /// do not promise FIFO waiter selection; the message queue's FIFO is unchanged.
     #[cold]
     pub(crate) fn notify_one(&self, count: &AtomicUsize) {
         if let Some(notification) = self.claim() {
@@ -368,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn fifo_across_pages_and_reuse_after_notification_and_cancellation() {
+    fn notify_each_registration_once_and_reuse_after_cancellation() {
         let list = WaiterList::new();
         let count = AtomicUsize::new(0);
         let next = AtomicU64::new(1);
@@ -381,16 +457,21 @@ mod tests {
             }
             assert_eq!(pages(&list), 4);
             assert_eq!(count.load(Relaxed), n);
-            for i in 0..n {
-                if round % 2 == 0 {
+            if round % 2 == 0 {
+                for i in 0..n {
                     list.notify_one(&count);
-                    for (j, wake) in wakes.iter().enumerate() {
-                        assert_eq!(wake.0.load(Relaxed), usize::from(j <= i));
-                    }
+                    assert_eq!(
+                        wakes.iter().map(|w| w.0.load(Relaxed)).sum::<usize>(),
+                        i + 1
+                    );
+                    assert!(wakes.iter().all(|w| w.0.load(Relaxed) <= 1));
+                    assert_eq!(count.load(Relaxed), n - i - 1);
                 }
-                list.unregister(&count, &mut tokens[i], false);
-                assert_eq!(count.load(Relaxed), n - i - 1);
             }
+            for token in &mut tokens {
+                list.unregister(&count, token, false);
+            }
+            assert_eq!(count.load(Relaxed), 0);
         }
     }
 
@@ -426,6 +507,32 @@ mod tests {
             .slots
             .iter()
             .all(|s| s.state.load(Relaxed) == FREE));
+    }
+
+    #[test]
+    fn moving_a_used_list_preserves_embedded_and_heap_cursors() {
+        let list = WaiterList::new();
+        let count = AtomicUsize::new(0);
+        let next = AtomicU64::new(1);
+        let wake = Arc::new(Counter(Count::new(0)));
+        let mut tokens: Vec<_> = (0..PAGE_SLOTS + 1).map(|_| None).collect();
+        for token in &mut tokens {
+            list.register(&count, &next, token, &Waker::from(wake.clone()));
+        }
+        list.notify_one(&count);
+        // Notify cursor names the embedded page; registration cursor names a heap
+        // page. Both must remain usable after moving the list into new storage.
+        let list = Box::new(list);
+        list.notify_all(&count);
+        for token in &mut tokens {
+            list.unregister(&count, token, false);
+        }
+        let mut again = None;
+        list.register(&count, &next, &mut again, &Waker::from(wake.clone()));
+        list.notify_one(&count);
+        list.unregister(&count, &mut again, false);
+        assert_eq!(wake.0.load(Relaxed), PAGE_SLOTS + 2);
+        assert_eq!(count.load(Relaxed), 0);
     }
 
     #[test]

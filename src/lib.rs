@@ -1,6 +1,6 @@
 //! # rapidfire
 //!
-//! An ultra low-latency, lock-free, dependency-free async MPMC channel for Rust.
+//! Async MPMC and MPSC channels with receive batching and no runtime dependencies.
 //!
 //! Designed for high-throughput, latency-critical pipelines (trading bots, WebSocket
 //! fan-in, market-data multiplexers) where message loss is unacceptable and every
@@ -8,9 +8,9 @@
 //!
 //! ## Architecture
 //!
-//! - **Own lock-free block queue, zero dependencies.**  Values live in 63-slot blocks
+//! - **Atomic block queue, zero dependencies.**  Values live in 63-slot blocks
 //!   chained through `prev`/`next` pointers.  Producers claim a slot on the tail index
-//!   (a wait-free `fetch_add` while uncontended, a CAS once contention is observed,
+//!   (`fetch_add` while uncontended, a CAS once contention is observed,
 //!   because with several producers CAS serialises the claims and keeps adjacent-slot
 //!   writes from fighting over one cache line); consumers check the head slot's state
 //!   and claim it with a CAS only once the value is there, so they never touch the
@@ -24,7 +24,7 @@
 //!   block, each block's producer header and consumer header (read marks) and the
 //!   rarely written wake-up flags all live on separate lines.  On the hot path the
 //!   only lines that cross cores are the slot lines carrying the values.
-//! - **Zero-cost sleep and wake, no `SeqCst` on the hot path.**  While messages flow
+//! - **No waiter registration while messages flow.**  While messages flow
 //!   no lock is taken and no waker is cloned.  A producer only does a `Relaxed` load
 //!   of one read-mostly flag right after its claim; the party that goes to sleep pays
 //!   instead, with one RMW on the other side's index that every later claim
