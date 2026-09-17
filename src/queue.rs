@@ -1,4 +1,4 @@
-//! The lock-free unbounded MPMC queue at the heart of the channel.
+//! The atomic block queue at the heart of the channel.
 //!
 //! # Design
 //!
@@ -45,8 +45,8 @@
 //! * Slot states are **tagged with the lap number**, so they need no reset when a
 //!   block is recycled: an old tag cannot be mistaken for the current lap's `WRITTEN`.
 //! * Blocks are **never freed while the queue lives**; they cycle through a one-block
-//!   spare slot and a mutex-protected overflow pool, accessed only when acquiring or
-//!   recycling blocks. This makes it sound to dereference a block pointer that may be
+//!   spare slot and an atomic ownership pool (see below), accessed only when acquiring
+//!   or recycling blocks. This makes it sound to dereference a block pointer that may be
 //!   stale: it always points at valid memory, a pooled block carries `start ==
 //!   usize::MAX`, a re-linked one carries a start that can never equal a lap it served
 //!   before, a stale slot state can never match the current lap, and the CAS on
@@ -54,6 +54,45 @@
 //!   channel's high-water mark until it is dropped.
 //! * A bounded producer caches the last head it saw (`tail.cached`) and reloads the
 //!   real head only when the cache says the queue looks full.
+//!
+//! # The block ownership pool
+//!
+//! Blocks that leave the live chain are parked in [`BlockPool`]: append-only linked
+//! *pages* of `AtomicPtr` slots, the first page embedded in the queue so a channel whose
+//! block high-water mark fits in it never allocates a page at all.  The pool replaces an
+//! earlier mutex and rests on one rule -- **a slot is an ownership hand-off, not a
+//! container**:
+//!
+//! * A block is *taken* with `swap(null, Acquire)`.  Exactly one thread can observe a
+//!   given pointer, so two threads can never believe they own the same block.  Ownership
+//!   is decided by the swap, never by comparing a pointer value, so re-publishing the
+//!   same (reused) block into the same slot cannot be mistaken for the old one: there is
+//!   no ABA to lose to, unlike a Treiber pop that reads a head pointer, dereferences it
+//!   and CASes the pointer value back.
+//! * A block is *published* with `compare_exchange(null -> block, Release, ..)`, by the
+//!   thread that exclusively owns it and gives that ownership up.  The Release pairs with
+//!   the taker's Acquire so the taker sees the reset that preceded publication.
+//! * A **retired** block -- one whose last slot was consumed while an earlier reader had
+//!   not finished -- is taken out of the pool *before* `readers_done` is consulted.
+//!   Checking a still-published block and removing it afterwards would be unsound even
+//!   with a CAS: in between, the block can be taken, reset, refilled and recycled into
+//!   the same slot, so the CAS matches the identical pointer while the answer describes a
+//!   different incarnation.  A block whose readers are unfinished is published straight
+//!   back, unchanged; nobody ever waits for a reader.
+//! * Page links are append-only, published with Release and never cleared, so every page
+//!   pointer stays valid and every slot keeps its address until `Queue::drop` (which has
+//!   `&mut self` and therefore exclusive access).  That is what makes the scan hints
+//!   below safe to follow even when they are stale.
+//! * `stored` and the scan hints are hints only: correctness never depends on finding a
+//!   pooled block, because the caller just allocates instead.  `stored == 0` short-cuts
+//!   the scan, so a channel that is only growing never walks the pool, and a scan is
+//!   capped at `POOL_SCAN_BUDGET` slots, so no allocation is ever O(live blocks).
+//!
+//! Every pool operation finishes in a bounded number of its own steps and no operation
+//! can leave the pool in a state that stalls another one -- a thread pre-empted while it
+//! owns a block only delays the reuse of that block.  This says nothing about the
+//! channel as a whole: the reservation protocol above still lets a pre-empted producer
+//! stall consumers at a claimed slot, and that is unchanged here.
 //!
 //! # Memory ordering: the sleep/wake hand-off
 //!
@@ -95,7 +134,7 @@
 
 use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use crate::sync::{
-    spin_loop, yield_now, AtomicPtr, AtomicU8, AtomicUsize, CachePadded, Mutex, UnsafeCell,
+    spin_loop, yield_now, AtomicPtr, AtomicU8, AtomicUsize, CachePadded, UnsafeCell,
 };
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::mem::MaybeUninit;
@@ -344,11 +383,286 @@ impl<T> Block<T> {
     }
 }
 
-/// Blocks outside the live chain. A retired block still belongs to its outstanding
-/// readers and must pass `readers_done` before it can be reused.
+/// Slots in one pool page.  Smaller under the small-block configurations so tests reach
+/// the multi-page paths quickly.
+#[cfg(any(feature = "loom", fcrs_small_blocks))]
+const POOL_PAGE_SLOTS: usize = 4;
+#[cfg(not(any(feature = "loom", fcrs_small_blocks)))]
+const POOL_PAGE_SLOTS: usize = 16;
+
+/// Slots one take visits before giving up and letting the caller allocate.  This is what
+/// bounds an allocation: a miss costs a fixed walk, never O(live blocks).
+const POOL_SCAN_BUDGET: usize = 4 * POOL_PAGE_SLOTS;
+
+/// Retired blocks one allocation inspects before allocating instead.  Each probe looks at
+/// a *different* block (probed blocks are held out of the pool until the end), so this
+/// caps the work even when many readers are stalled at once.
+const RETIRED_PROBES: usize = 4;
+
+/// One page of ownership slots.
+///
+/// `next` is append-only: published once with Release and never changed again while the
+/// queue lives, so a page pointer -- including a stale scan hint -- always addresses a
+/// live page whose slots are at a fixed address.
+struct PoolPage<T> {
+    slots: [AtomicPtr<Block<T>>; POOL_PAGE_SLOTS],
+    next: AtomicPtr<PoolPage<T>>,
+}
+
+impl<T> PoolPage<T> {
+    fn new() -> Self {
+        PoolPage {
+            slots: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+            next: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    fn alloc() -> *mut PoolPage<T> {
+        Box::into_raw(Box::new(PoolPage::new()))
+    }
+
+    /// # Safety
+    /// `page` must come from [`PoolPage::alloc`] and be unreachable (never linked, or
+    /// reached during exclusive teardown).
+    unsafe fn release(page: *mut PoolPage<T>) {
+        drop(Box::from_raw(page));
+    }
+}
+
+/// Where a scan starts.  Purely a hint; both fields may be stale or disagree, and the
+/// page pointer stays dereferenceable because pages are never freed before `Queue::drop`.
+/// Takes and publications keep separate hints so that a sweep of occupied slots and a
+/// sweep of free slots do not drag each other backwards.
+struct PoolHint<T> {
+    page: AtomicPtr<PoolPage<T>>,
+    slot: AtomicUsize,
+}
+
+impl<T> PoolHint<T> {
+    fn new() -> Self {
+        PoolHint {
+            // Null means "the embedded page": the queue is moved into its `Arc` after
+            // construction, so no real page address may be recorded before that.
+            page: AtomicPtr::new(ptr::null_mut()),
+            slot: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Blocks outside the live chain, held in linked pages of ownership slots.
+///
+/// Two pools exist per queue: `ready` blocks are reusable immediately, `retired` blocks
+/// may still belong to an outstanding reader and must pass `readers_done` -- checked only
+/// by the thread that already took them -- before reuse.  See the module docs for the
+/// ownership rules this relies on.
 struct BlockPool<T> {
-    ready: Vec<*mut Block<T>>,
-    retired: Vec<*mut Block<T>>,
+    /// First page, embedded so an ordinary channel never allocates pool memory.
+    first: PoolPage<T>,
+    /// Pages currently linked.  Only ever grows; used to size a full-cycle scan.
+    pages: AtomicUsize,
+    /// Count raised before publication and lowered after ownership is taken. A relaxed
+    /// snapshot can be stale; it is only an optimization hint, never an ownership test.
+    stored: AtomicUsize,
+    take_hint: PoolHint<T>,
+    put_hint: PoolHint<T>,
+}
+
+impl<T> BlockPool<T> {
+    fn new() -> Self {
+        BlockPool {
+            first: PoolPage::new(),
+            pages: AtomicUsize::new(1),
+            stored: AtomicUsize::new(0),
+            take_hint: PoolHint::new(),
+            put_hint: PoolHint::new(),
+        }
+    }
+
+    #[inline]
+    fn hint_page(&self, hint: &PoolHint<T>) -> *const PoolPage<T> {
+        let page = hint.page.load(Acquire);
+        if page.is_null() {
+            &self.first
+        } else {
+            page
+        }
+    }
+
+    #[inline]
+    fn set_hint(&self, hint: &PoolHint<T>, page: *const PoolPage<T>, slot: usize) {
+        // Never retain a pointer into the embedded page: a privately owned pool
+        // can move after use. Heap pages keep their address throughout the move.
+        let page = if ptr::eq(page, &self.first) {
+            ptr::null_mut()
+        } else {
+            page as *mut PoolPage<T>
+        };
+        hint.page.store(page, Release);
+        hint.slot.store(slot, Relaxed);
+    }
+
+    /// Visits at most `budget` slots from `hint`, following the append-only page links
+    /// and wrapping to the embedded page at the end of the list.  Stops as soon as `f`
+    /// returns a value.
+    fn scan<R>(
+        &self,
+        hint: &PoolHint<T>,
+        budget: usize,
+        mut f: impl FnMut(&AtomicPtr<Block<T>>, *const PoolPage<T>, usize) -> Option<R>,
+    ) -> Option<R> {
+        let mut page = self.hint_page(hint);
+        let mut slot = hint.slot.load(Relaxed) % POOL_PAGE_SLOTS;
+        let mut visited = 0;
+        while visited < budget {
+            // SAFETY: pages are only appended and are freed by `Queue::drop` alone, so
+            // any pointer the hint or a `next` link yields addresses a live page.
+            let slots = unsafe { &(*page).slots };
+            while slot < POOL_PAGE_SLOTS && visited < budget {
+                if let Some(found) = f(&slots[slot], page, slot) {
+                    return Some(found);
+                }
+                visited += 1;
+                slot += 1;
+            }
+            if slot == POOL_PAGE_SLOTS {
+                // SAFETY: as above.
+                let next = unsafe { (*page).next.load(Acquire) };
+                page = if next.is_null() { &self.first } else { next };
+                slot = 0;
+            }
+        }
+        // A miss must advance the sweep too. Otherwise a stale hint pointing at
+        // more than one budget of empty slots can hide ready blocks indefinitely.
+        self.set_hint(hint, page, slot);
+        None
+    }
+
+    /// Takes exclusive ownership of one pooled block, or `None` if the bounded scan found
+    /// none.  `None` is always a valid answer: the caller allocates instead.
+    fn take(&self) -> Option<*mut Block<T>> {
+        if self.stored.load(Relaxed) == 0 {
+            // A channel that is only growing never walks the pool.
+            return None;
+        }
+        let found = self.scan(&self.take_hint, POOL_SCAN_BUDGET, |slot, page, index| {
+            if slot.load(Relaxed).is_null() {
+                return None;
+            }
+            // The swap is the hand-off: whoever sees a non-null pointer here is from
+            // this moment its only owner.
+            let block = slot.swap(ptr::null_mut(), Acquire);
+            if block.is_null() {
+                return None;
+            }
+            // Resume the sweep at the slot we emptied: the next take walks forward into
+            // the still-occupied run, and the next publication refills it.
+            self.set_hint(&self.take_hint, page, index);
+            Some(block)
+        });
+        if found.is_some() {
+            self.stored.fetch_sub(1, Relaxed);
+        }
+        found
+    }
+
+    /// Publishes a block the caller owns exclusively, giving that ownership up.
+    ///
+    /// Always succeeds: when every slot is occupied the page list grows by one page.
+    /// The (rare) page allocation happens while the caller owns nothing but this block,
+    /// so it blocks no other pool operation.
+    ///
+    /// # Safety
+    /// `block` must be exclusively owned for recycling and unreachable from the
+    /// live chain except through stale pointers that re-validate `start`. Ready
+    /// blocks hold no live values. A retired block may still contain values claimed
+    /// by paused readers; only a later successful readers_done check permits reset.
+    unsafe fn put(&self, block: *mut Block<T>) {
+        // Raised before publication so a successful take cannot underflow the count.
+        self.stored.fetch_add(1, Relaxed);
+        loop {
+            // A full cycle: every slot of every page currently linked, once.
+            let budget = self.pages.load(Relaxed) * POOL_PAGE_SLOTS;
+            let published = self.scan(&self.put_hint, budget, |slot, page, index| {
+                if !slot.load(Relaxed).is_null() {
+                    return None;
+                }
+                match slot.compare_exchange(ptr::null_mut(), block, Release, Relaxed) {
+                    Ok(_) => {
+                        self.set_hint(&self.put_hint, page, index);
+                        Some(())
+                    }
+                    Err(_) => None,
+                }
+            });
+            if published.is_some() {
+                return;
+            }
+            self.grow();
+        }
+    }
+
+    /// Appends one page, or adopts the page another thread appended first.
+    #[cold]
+    fn grow(&self) {
+        let fresh = PoolPage::<T>::alloc();
+        let mut page = self.hint_page(&self.put_hint);
+        loop {
+            // SAFETY: pages live until `Queue::drop`; see `scan`.
+            let next = unsafe { (*page).next.load(Acquire) };
+            if !next.is_null() {
+                page = next;
+                continue;
+            }
+            // SAFETY: as above.  Release publishes the initialised slots of `fresh`.
+            let linked = unsafe {
+                (*page)
+                    .next
+                    .compare_exchange(ptr::null_mut(), fresh, Release, Acquire)
+            };
+            match linked {
+                Ok(_) => {
+                    self.pages.fetch_add(1, Relaxed);
+                    self.set_hint(&self.put_hint, fresh, 0);
+                }
+                Err(theirs) => {
+                    // Somebody else grew the pool; point the hint at their page so the
+                    // retrying publication lands there, and drop ours, which was never
+                    // linked or seen by anyone.
+                    self.set_hint(&self.put_hint, theirs, 0);
+                    // SAFETY: `fresh` comes from `PoolPage::alloc` and is unreachable.
+                    unsafe { PoolPage::release(fresh) };
+                }
+            }
+            return;
+        }
+    }
+
+    /// Frees every pooled block and every appended page.
+    ///
+    /// # Safety
+    /// Exclusive access to the pool; no pool operation may be in flight, and no pooled
+    /// block may hold a live value.
+    unsafe fn release_all(&mut self) {
+        let mut page: *mut PoolPage<T> = &mut self.first;
+        let mut heap = false;
+        loop {
+            for slot in (*page).slots.iter() {
+                let block = slot.load(Relaxed);
+                if !block.is_null() {
+                    Block::release(block);
+                }
+            }
+            let next = (*page).next.load(Relaxed);
+            if heap {
+                PoolPage::release(page);
+            }
+            if next.is_null() {
+                return;
+            }
+            page = next;
+            heap = true;
+        }
+    }
 }
 
 struct Position<T> {
@@ -376,8 +690,11 @@ pub(crate) struct Queue<T> {
     /// One-block fast path of the pool: filled by the recycling consumer, emptied by
     /// the producer that needs a new block.
     spare: CachePadded<AtomicPtr<Block<T>>>,
-    /// Overflow pool for recycled blocks (see the module docs on never freeing).
-    pool: Mutex<BlockPool<T>>,
+    /// Overflow pool of immediately reusable blocks (see the module docs on never
+    /// freeing and on the ownership protocol).
+    ready: BlockPool<T>,
+    /// Blocks whose last slot was consumed while an earlier reader had not finished.
+    retired: BlockPool<T>,
     /// Bounded capacity, or `UNBOUNDED`.  A plain word rather than `Option<usize>` so
     /// the hot path tests one load instead of a discriminant plus a value.
     capacity: usize,
@@ -408,10 +725,8 @@ impl<T> Queue<T> {
                 contended: AtomicUsize::new(0),
             }),
             spare: CachePadded(AtomicPtr::new(ptr::null_mut())),
-            pool: Mutex::new(BlockPool {
-                ready: Vec::new(),
-                retired: Vec::new(),
-            }),
+            ready: BlockPool::new(),
+            retired: BlockPool::new(),
             capacity: capacity.unwrap_or(UNBOUNDED),
         }
     }
@@ -468,11 +783,6 @@ impl<T> Queue<T> {
         items_between(head, tail).min(self.capacity)
     }
 
-    #[inline]
-    fn lock_pool(&self) -> crate::sync::MutexGuard<'_, BlockPool<T>> {
-        self.pool.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     #[inline(always)]
     fn take_block(&self) -> *mut Block<T> {
         let block = self.spare.swap(ptr::null_mut(), Acquire);
@@ -484,26 +794,54 @@ impl<T> Queue<T> {
 
     #[cold]
     fn take_block_slow(&self) -> *mut Block<T> {
-        let retired = {
-            let mut pool = self.lock_pool();
-            if let Some(block) = pool.ready.pop() {
-                return block;
-            }
-            // Never wait for a reader. If no retired block is ready, allocate another
-            // block. Removal under the lock gives this producer sole recycling rights.
-            let ready = pool.retired.iter().position(|&block| {
-                // SAFETY: retired blocks are allocated and stay outside the live chain.
-                unsafe { (*block).readers_done() }
-            });
-            ready.map(|i| pool.retired.swap_remove(i))
-        };
-        if let Some(block) = retired {
-            // SAFETY: every reader's Release mark was observed with Acquire above,
-            // and no other producer can remove the same block from the retired list.
-            unsafe { (*block).reset() };
+        if let Some(block) = self.ready.take() {
             return block;
         }
+        if let Some(block) = self.reclaim_retired() {
+            return block;
+        }
+        // Never wait for a reader, and never trade a bounded scan for an unbounded one:
+        // a fresh block is cheaper than either.
         Block::allocate()
+    }
+
+    /// Reclaims one retired block whose readers have all finished, if a bounded number of
+    /// probes finds one.
+    ///
+    /// Each candidate is taken out of the pool *before* `readers_done` is consulted, so
+    /// the probing thread owns it exclusively while it decides; see the module docs for
+    /// why a check on a still-published block would be unsound however it is removed
+    /// afterwards.  Candidates that are still owned by a paused reader are published back
+    /// unchanged -- they are held out of the pool meanwhile, so no probe inspects the
+    /// same block twice.
+    #[cold]
+    fn reclaim_retired(&self) -> Option<*mut Block<T>> {
+        let mut parked: [*mut Block<T>; RETIRED_PROBES] = [ptr::null_mut(); RETIRED_PROBES];
+        let mut held = 0;
+        let mut reclaimed = None;
+        while held < RETIRED_PROBES {
+            let block = match self.retired.take() {
+                Some(block) => block,
+                None => break,
+            };
+            // SAFETY: the swap out of the pool made this thread the block's only owner;
+            // retired blocks stay allocated and outside the live chain.  The Acquire
+            // marks in `readers_done` observe every reader's Release.
+            if unsafe { (*block).readers_done() } {
+                // SAFETY: as above -- exclusive ownership, all readers finished.
+                unsafe { (*block).reset() };
+                reclaimed = Some(block);
+                break;
+            }
+            parked[held] = block;
+            held += 1;
+        }
+        for &block in &parked[..held] {
+            // SAFETY: owned by this thread, still retired and unchanged; all of its
+            // values were claimed; a paused reader may not have moved its value yet.
+            unsafe { self.retired.put(block) };
+        }
+        reclaimed
     }
 
     /// Returns a block to the pool.
@@ -522,9 +860,11 @@ impl<T> Queue<T> {
         }
     }
 
+    /// # Safety
+    /// As [`Queue::recycle`].
     #[cold]
-    fn recycle_slow(&self, block: *mut Block<T>) {
-        self.lock_pool().ready.push(block);
+    unsafe fn recycle_slow(&self, block: *mut Block<T>) {
+        self.ready.put(block);
     }
 
     /// Appends `value`.  Returns `Err(value)` only when a bounded queue is full.
@@ -987,7 +1327,9 @@ impl<T> Queue<T> {
         // until a future installer observes every Release mark; do not hold this
         // consumer (and possibly an executor worker) hostage to the paused reader.
         if !(*block).readers_done() {
-            self.lock_pool().retired.push(block);
+            // Retire it: every value here was claimed and moved out or is about to be by
+            // the reader that claimed it, so the block holds nothing this queue owns.
+            self.retired.put(block);
             return;
         }
         (*block).reset();
@@ -1031,10 +1373,9 @@ impl<T> Queue<T> {
                 h, h >> LAP_SHIFT, hoff, hb, hs as isize, hstate, written_tag(h >> LAP_SHIFT),
                 self.head.contended.load(Relaxed),
                 t, tb, ts as isize, self.tail.contended.load(Relaxed),
-                self.spare.load(Relaxed), {
-                    let pool = self.lock_pool();
-                    pool.ready.len() + pool.retired.len()
-                }, chain
+                self.spare.load(Relaxed),
+                self.ready.stored.load(Relaxed) + self.retired.stored.load(Relaxed),
+                chain
             )
         }
     }
@@ -1075,12 +1416,13 @@ impl<T> Drop for Queue<T> {
             if !spare.is_null() {
                 Block::release(spare);
             }
-            let pool = &mut *self.lock_pool();
             // Exclusive channel destruction means even deferred readers have
             // finished. All values in retired blocks were already claimed and moved.
-            for block in pool.ready.drain(..).chain(pool.retired.drain(..)) {
-                Block::release(block);
-            }
+            // Every block ever allocated is in exactly one of: the chain above, the
+            // spare slot, or one pool slot -- nothing is in flight under `&mut self` --
+            // so this frees each of them exactly once.
+            self.ready.release_all();
+            self.retired.release_all();
         }
     }
 }
@@ -1088,6 +1430,81 @@ impl<T> Drop for Queue<T> {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+
+    /// Test-only views of the pool.  They walk every slot of every page, so they report
+    /// the exact contents rather than the `stored` hint.
+    impl<T> BlockPool<T> {
+        /// Every block currently published, in page/slot order.
+        fn snapshot(&self) -> Vec<*mut Block<T>> {
+            let mut blocks = Vec::new();
+            let mut page: *const PoolPage<T> = &self.first;
+            loop {
+                // SAFETY: pages live until `Queue::drop`.
+                unsafe {
+                    for slot in (*page).slots.iter() {
+                        let block = slot.load(Acquire);
+                        if !block.is_null() {
+                            blocks.push(block);
+                        }
+                    }
+                    let next = (*page).next.load(Acquire);
+                    if next.is_null() {
+                        return blocks;
+                    }
+                    page = next;
+                }
+            }
+        }
+
+        fn page_count(&self) -> usize {
+            let mut pages = 1;
+            let mut page: *const PoolPage<T> = &self.first;
+            // SAFETY: as in `snapshot`.
+            while let Some(next) = unsafe { (*page).next.load(Acquire).as_ref() } {
+                pages += 1;
+                page = next;
+            }
+            pages
+        }
+    }
+
+    /// Every block this queue owns: the live chain, the spare slot and both pools.
+    fn owned_blocks<T>(q: &Queue<T>) -> Vec<*mut Block<T>> {
+        let mut blocks = Vec::new();
+        let mut block = q.head.block.load(Acquire);
+        while !block.is_null() {
+            blocks.push(block);
+            // SAFETY: blocks are never freed while the queue lives.
+            block = unsafe { (*block).phdr.0.next.load(Acquire) };
+        }
+        let spare = q.spare.load(Acquire);
+        if !spare.is_null() {
+            blocks.push(spare);
+        }
+        blocks.extend(q.ready.snapshot());
+        blocks.extend(q.retired.snapshot());
+        blocks
+    }
+
+    fn unique(blocks: &[*mut u8]) -> bool {
+        let mut sorted = blocks.to_vec();
+        sorted.sort_unstable();
+        let len = sorted.len();
+        sorted.dedup();
+        sorted.len() == len
+    }
+
+    fn as_addrs<T>(blocks: &[*mut Block<T>]) -> Vec<*mut u8> {
+        blocks.iter().map(|&b| b as *mut u8).collect()
+    }
+
+    /// A block pointer a test thread may carry.  Sound for the same reason the queue's
+    /// own `Send` impl is: blocks stay allocated and only the thread that owns one (here:
+    /// took it out of a pool slot) ever touches it.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    struct SendBlock<T>(*mut Block<T>);
+    // SAFETY: as above.
+    unsafe impl<T: Send> Send for SendBlock<T> {}
 
     #[test]
     fn items_between_skips_sentinels() {
@@ -1126,7 +1543,7 @@ mod tests {
             assert_eq!(q.pop(&flag).map(|v| v.0), Some(round + 1));
         }
         assert_eq!(q.pop(&flag).map(|v| v.0), None);
-        assert!(q.lock_pool().ready.len() <= 1);
+        assert!(q.ready.snapshot().len() <= 1);
     }
 
     #[test]
@@ -1143,7 +1560,7 @@ mod tests {
             assert_eq!(q.pop(&flag).map(|v| v.0), None);
         }
         // Blocks were reused, not re-allocated: the pool holds the ones from round 0.
-        assert!(q.lock_pool().ready.len() >= 15);
+        assert!(q.ready.snapshot().len() >= 15);
     }
 
     #[test]
@@ -1217,7 +1634,7 @@ mod tests {
                 q.push(Box::new(value), &flag).unwrap();
                 assert_eq!(*q.pop(&flag).unwrap().0, value);
             }
-            assert_eq!(q.lock_pool().retired.as_slice(), &[block]);
+            assert_eq!(q.retired.snapshot(), vec![block]);
 
             // The paused reader still owns the original Box; recycling it early
             // would corrupt this value or cause a double-free (also checked by Miri).
@@ -1229,10 +1646,10 @@ mod tests {
             if reclaim {
                 // No ready overflow blocks exist in this interleaved workload, so
                 // the next slow allocation must reclaim the now-finished block.
-                assert!(q.lock_pool().ready.is_empty());
+                assert!(q.ready.snapshot().is_empty());
                 let reused = q.take_block_slow();
                 assert_eq!(reused, block);
-                assert!(q.lock_pool().retired.is_empty());
+                assert!(q.retired.snapshot().is_empty());
                 unsafe { q.recycle(reused) };
             }
             // Both reclamation and dropping a still-retired, now-quiescent block
@@ -1424,5 +1841,362 @@ mod tests {
             assert_eq!(*v, i);
         }
         assert_eq!(q.pop(&FLAG).map(|v| v.0), None);
+    }
+
+    /// A backlog that recycles more blocks than one pool page holds.  A whole number of
+    /// blocks, so a round leaves head and tail on a block boundary and the next round
+    /// needs exactly as many blocks as the last one did.
+    const MULTI_PAGE_VALUES: usize = (POOL_PAGE_SLOTS + 4) * BLOCK_CAP;
+
+    #[test]
+    fn pool_spans_pages_and_reuses_every_block() {
+        let q = Queue::new(None);
+        let flag = AtomicUsize::new(0);
+        for i in 0..MULTI_PAGE_VALUES {
+            q.push(i, &flag).unwrap();
+        }
+        for i in 0..MULTI_PAGE_VALUES {
+            assert_eq!(q.pop(&flag).map(|v| v.0), Some(i));
+        }
+
+        // The embedded page overflowed, so the appended pages are in use.
+        assert!(q.ready.page_count() >= 2, "pool did not grow a second page");
+        let pooled = q.ready.snapshot();
+        assert!(pooled.len() > POOL_PAGE_SLOTS);
+        // One slot per block: publication is a CAS from null, so nothing is duplicated.
+        assert!(unique(&as_addrs(&pooled)));
+        let high_water = owned_blocks(&q);
+        assert!(unique(&as_addrs(&high_water)));
+        let pages = q.ready.page_count();
+
+        // An identical second round must come entirely out of the pool.
+        for i in 0..MULTI_PAGE_VALUES {
+            q.push(i, &flag).unwrap();
+        }
+        assert!(
+            q.ready.snapshot().len() < pooled.len(),
+            "no block was taken"
+        );
+        for i in 0..MULTI_PAGE_VALUES {
+            assert_eq!(q.pop(&flag).map(|v| v.0), Some(i));
+        }
+        let after = owned_blocks(&q);
+        assert!(unique(&as_addrs(&after)));
+        assert_eq!(
+            after.len(),
+            high_water.len(),
+            "reuse allocated fresh blocks"
+        );
+        assert_eq!(q.ready.page_count(), pages, "reuse grew the pool");
+    }
+
+    #[test]
+    fn multi_page_pool_drops_every_value_exactly_once() {
+        use std::sync::atomic::{AtomicUsize as Counter, Ordering as Ord2};
+        static DROPS: Counter = Counter::new(0);
+        struct D;
+        impl Drop for D {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ord2::Relaxed);
+            }
+        }
+        let backlog = MULTI_PAGE_VALUES / 2;
+        {
+            let q = Queue::new(None);
+            let flag = AtomicUsize::new(0);
+            for _ in 0..MULTI_PAGE_VALUES {
+                assert!(q.push(D, &flag).is_ok());
+            }
+            for _ in 0..MULTI_PAGE_VALUES {
+                drop(q.pop(&flag));
+            }
+            assert!(q.ready.page_count() >= 2);
+            assert_eq!(DROPS.load(Ord2::Relaxed), MULTI_PAGE_VALUES);
+            // Leave values behind in blocks that came back out of the multi-page pool.
+            for _ in 0..backlog {
+                assert!(q.push(D, &flag).is_ok());
+            }
+        }
+        assert_eq!(DROPS.load(Ord2::Relaxed), MULTI_PAGE_VALUES + backlog);
+    }
+
+    #[test]
+    fn a_stale_hint_does_not_hide_blocks_after_a_long_empty_range() {
+        let mut pool = BlockPool::<usize>::new();
+        for _ in 0..2 * POOL_SCAN_BUDGET + 1 {
+            // SAFETY: new empty blocks, exclusively owned until publication.
+            unsafe { pool.put(Block::allocate()) };
+        }
+        for _ in 0..2 * POOL_SCAN_BUDGET {
+            let block = pool.take().expect("populated range");
+            // SAFETY: exclusively removed and never part of a live queue chain.
+            unsafe { Block::release(block) };
+        }
+        // A taker paused before publishing its hint can legitimately restore this
+        // old position after other threads empty two complete scan budgets.
+        pool.set_hint(&pool.take_hint, &pool.first, 0);
+        assert!(pool.take().is_none());
+        assert!(pool.take().is_none());
+        let last = pool
+            .take()
+            .expect("misses must advance past the empty range");
+        // SAFETY: last owns the only remaining block; the pool owns its pages.
+        unsafe {
+            Block::release(last);
+            pool.release_all();
+        }
+    }
+
+    #[test]
+    fn moving_a_used_pool_preserves_embedded_page_hints() {
+        let pool = BlockPool::<usize>::new();
+        for _ in 0..3 {
+            // SAFETY: new empty blocks, exclusively owned until publication.
+            unsafe { pool.put(Block::allocate()) };
+        }
+        let first = pool.take().unwrap();
+        unsafe { Block::release(first) };
+        // This invalidates pointers into the previous embedded page's storage.
+        let mut pool = Box::new(pool);
+        let a = pool.take().unwrap();
+        let b = pool.take().unwrap();
+        assert_ne!(a, b);
+        assert!(pool.take().is_none());
+        // Also exercise a put hint recorded before the move.
+        unsafe {
+            pool.put(a);
+            pool.put(b);
+            pool.release_all();
+        }
+    }
+
+    #[test]
+    fn pool_hands_each_block_to_exactly_one_taker() {
+        use std::sync::Arc;
+        use std::thread;
+        const THREADS: usize = 4;
+        // Fills four pages exactly, so one scan budget covers the whole pool and a take
+        // only ever misses because a peer won the slot.
+        let total = 3 * POOL_PAGE_SLOTS + 1;
+
+        let q: Arc<Queue<usize>> = Arc::new(Queue::new(None));
+        let mut made = Vec::with_capacity(total);
+        for _ in 0..total {
+            let block = Block::<usize>::allocate();
+            made.push(block);
+            // SAFETY: freshly allocated, owned by this thread, holding no values.
+            unsafe { q.ready.put(block) };
+        }
+        assert_eq!(q.ready.snapshot().len(), total);
+        assert_eq!(q.ready.page_count(), 4);
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let mut takers = Vec::new();
+        for _ in 0..THREADS {
+            let q = q.clone();
+            let seen = seen.clone();
+            takers.push(thread::spawn(move || {
+                let mut mine = Vec::new();
+                while seen.load(Relaxed) < total {
+                    match q.ready.take() {
+                        Some(block) => {
+                            mine.push(SendBlock(block));
+                            seen.fetch_add(1, Relaxed);
+                        }
+                        None => std::hint::spin_loop(),
+                    }
+                }
+                mine
+            }));
+        }
+        let mut taken: Vec<*mut Block<usize>> = takers
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .map(|b| b.0)
+            .collect();
+
+        // Every block came out once and only once, and no taker invented one.
+        assert_eq!(taken.len(), total);
+        assert!(unique(&as_addrs(&taken)));
+        taken.sort_unstable();
+        let mut expected = made.clone();
+        expected.sort_unstable();
+        assert_eq!(taken, expected);
+        assert!(q.ready.snapshot().is_empty());
+
+        for block in taken {
+            // SAFETY: exclusively owned by this thread now, holding no values.
+            unsafe { q.ready.put(block) };
+        }
+        // Dropping the last handle frees the queue's own block and all `total` of these.
+        drop(q);
+    }
+
+    #[test]
+    fn concurrent_take_and_publish_conserve_every_block() {
+        use std::sync::Arc;
+        use std::thread;
+        const THREADS: usize = 4;
+        const ROUNDS: usize = if cfg!(miri) { 8 } else { 2_000 };
+        let total = POOL_PAGE_SLOTS + 3;
+
+        let q: Arc<Queue<usize>> = Arc::new(Queue::new(None));
+        let mut made = Vec::with_capacity(total);
+        for _ in 0..total {
+            let block = Block::<usize>::allocate();
+            made.push(block);
+            // SAFETY: freshly allocated and exclusively owned.
+            unsafe { q.ready.put(block) };
+        }
+
+        let mut workers = Vec::new();
+        for _ in 0..THREADS {
+            let q = q.clone();
+            workers.push(thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    if let Some(block) = q.ready.take() {
+                        // SAFETY: taken exclusively, handed straight back untouched.
+                        unsafe { q.ready.put(block) };
+                    }
+                }
+            }));
+        }
+        for w in workers {
+            w.join().unwrap();
+        }
+
+        let mut pooled = q.ready.snapshot();
+        assert!(unique(&as_addrs(&pooled)), "a block was published twice");
+        pooled.sort_unstable();
+        made.sort_unstable();
+        assert_eq!(pooled, made, "the pool lost or invented a block");
+        drop(q);
+    }
+
+    #[test]
+    fn retired_blocks_are_owned_before_the_readers_check() {
+        let q: Queue<usize> = Queue::new(None);
+        let mut retired = Vec::new();
+        for _ in 0..RETIRED_PROBES {
+            let block = Block::<usize>::allocate();
+            // SAFETY: freshly allocated and exclusively owned; no read marks are set,
+            // so each of these looks like a block a reader has not finished with.
+            unsafe { q.retired.put(block) };
+            retired.push(block);
+        }
+
+        // Nothing is reclaimable: every probe must hand its block back untouched.
+        assert!(q.reclaim_retired().is_none());
+        let mut parked = q.retired.snapshot();
+        parked.sort_unstable();
+        let mut expected = retired.clone();
+        expected.sort_unstable();
+        assert_eq!(parked, expected);
+
+        // Finish the readers of one block. The probe budget covers every retired block
+        // here, so exactly that one is taken, reset and handed out.
+        let target = retired[RETIRED_PROBES - 1];
+        // SAFETY: the block is allocated and quiescent.
+        unsafe {
+            for mark in &(*target).chdr.0.read_marks {
+                mark_read(mark);
+            }
+        }
+        assert_eq!(q.reclaim_retired(), Some(target));
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!((*target).phdr.0.start.load(Acquire), POOLED);
+            assert!((*target)
+                .chdr
+                .0
+                .read_marks
+                .iter()
+                .all(|m| m.load(Acquire) == 0));
+        }
+        let left = q.retired.snapshot();
+        assert_eq!(left.len(), RETIRED_PROBES - 1);
+        assert!(!left.contains(&target));
+
+        // SAFETY: reset, exclusively owned; hand it back so the queue frees it.
+        unsafe { q.ready.put(target) };
+        drop(q);
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod pool_loom_tests {
+    use super::*;
+    use crate::sync::Arc;
+    use loom::thread;
+
+    fn model(f: impl Fn() + Send + Sync + 'static) {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(f);
+    }
+
+    #[test]
+    fn pool_transfers_exclusive_payload_access() {
+        model(|| {
+            let pool = Arc::new(BlockPool::<usize>::new());
+            unsafe { pool.put(Block::allocate()) };
+            let mut workers = Vec::new();
+            for marker in 1..=2 {
+                let pool = pool.clone();
+                workers.push(thread::spawn(move || {
+                    if let Some(block) = pool.take() {
+                        // The tracked UnsafeCell remains borrowed over the yield.
+                        // Duplicate ownership would produce an overlapping access.
+                        unsafe {
+                            (*block).slots[0].value.with_mut(|p| {
+                                (*p).write(marker);
+                                thread::yield_now();
+                                assert_eq!((*p).assume_init_read(), marker);
+                            });
+                            pool.put(block);
+                        }
+                    }
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            let mut pool = match Arc::try_unwrap(pool) {
+                Ok(p) => p,
+                Err(_) => panic!("pool still shared"),
+            };
+            assert_eq!(pool.stored.load(Relaxed), 1);
+            unsafe { pool.release_all() };
+        });
+    }
+
+    #[test]
+    fn concurrent_page_append_keeps_all_blocks() {
+        model(|| {
+            let pool = Arc::new(BlockPool::<usize>::new());
+            for _ in 0..POOL_PAGE_SLOTS {
+                unsafe { pool.put(Block::allocate()) };
+            }
+            let other = pool.clone();
+            let worker = thread::spawn(move || unsafe { other.put(Block::allocate()) });
+            unsafe { pool.put(Block::allocate()) };
+            worker.join().unwrap();
+            let mut pool = match Arc::try_unwrap(pool) {
+                Ok(p) => p,
+                Err(_) => panic!("pool still shared"),
+            };
+            let mut blocks = Vec::new();
+            while let Some(block) = pool.take() {
+                blocks.push(block);
+            }
+            assert_eq!(blocks.len(), POOL_PAGE_SLOTS + 2);
+            for (i, &block) in blocks.iter().enumerate() {
+                assert!(!blocks[..i].contains(&block), "duplicate block ownership");
+            }
+            for block in blocks {
+                unsafe { Block::release(block) };
+            }
+            unsafe { pool.release_all() };
+        });
     }
 }
