@@ -41,6 +41,9 @@ struct Slot {
 // successful WAITING -> NOTIFYING notification accesses the payload. Publishing
 // WAITING transfers the initialized waker; FREE is published only after removal.
 // Cancellation of NOTIFYING changes only the atomic state, not the payload.
+// Release publishes each payload transition; the next successful owner acquires
+// it. Close/registration ordering is carried by the separate closing RMW, not
+// by a global sequentially consistent order on slots or page links.
 unsafe impl Sync for Slot {}
 
 impl Slot {
@@ -87,7 +90,7 @@ impl Page {
     }
 
     fn next(&self) -> Option<&Page> {
-        let next = self.next.load(SeqCst);
+        let next = self.next.load(Acquire);
         // SAFETY: published pages remain allocated until exclusive list Drop.
         unsafe { next.as_ref() }
     }
@@ -99,7 +102,7 @@ impl Page {
         let new = Box::into_raw(Box::new(Page::new(self.index + 1)));
         let next = match self
             .next
-            .compare_exchange(ptr::null_mut(), new, SeqCst, SeqCst)
+            .compare_exchange(ptr::null_mut(), new, AcqRel, Acquire)
         {
             Ok(_) => new,
             Err(existing) => {
@@ -173,12 +176,12 @@ impl Notification<'_> {
         // SAFETY: the successful WAITING -> NOTIFYING CAS transferred the waker
         // to this notifier. A racing cancellation cannot read or drop it.
         let waker = unsafe { self.slot.take_waker() };
-        let old = self.slot.state.swap(self.ticket | NOTIFIED, SeqCst);
+        let old = self.slot.state.swap(self.ticket | NOTIFIED, AcqRel);
         debug_assert!(old == (self.ticket | NOTIFYING) || old == (self.ticket | CANCELLED));
         if old & STATE_MASK == CANCELLED {
             // The token was surrendered to us. No other operation can free this
             // slot until we do, so it cannot yet have been reused.
-            self.slot.state.store(FREE, SeqCst);
+            self.slot.state.store(FREE, Release);
         }
         // When old was NOTIFYING, the token owner may already have freed/reused
         // the slot. Never touch it again. User code runs outside slot ownership.
@@ -245,7 +248,7 @@ impl WaiterList {
                 if slot.state.load(Relaxed) == FREE
                     && slot
                         .state
-                        .compare_exchange(FREE, ticket | WRITING, SeqCst, SeqCst)
+                        .compare_exchange(FREE, ticket | WRITING, AcqRel, Acquire)
                         .is_ok()
                 {
                     position.advance(&self.first);
@@ -256,7 +259,7 @@ impl WaiterList {
                     });
                     // Count first: a notifier cannot decrement before this increment.
                     count.fetch_add(1, SeqCst);
-                    slot.state.store(ticket | WAITING, SeqCst);
+                    slot.state.store(ticket | WAITING, Release);
                     // Paired with close's RMW: an earlier close becomes visible
                     // to the caller's recheck, a later close sees this slot/page.
                     self.closing.fetch_or(false, AcqRel);
@@ -302,13 +305,13 @@ impl WaiterList {
         let Some(token) = token.take() else { return };
         let slot = self.slot(&token);
         loop {
-            let state = slot.state.load(SeqCst);
+            let state = slot.state.load(Acquire);
             debug_assert_eq!(state & !STATE_MASK, token.ticket);
             match state & STATE_MASK {
                 WAITING => {
                     if slot
                         .state
-                        .compare_exchange(state, token.ticket | WRITING, SeqCst, SeqCst)
+                        .compare_exchange(state, token.ticket | WRITING, AcqRel, Acquire)
                         .is_err()
                     {
                         continue;
@@ -316,7 +319,7 @@ impl WaiterList {
                     count.fetch_sub(1, SeqCst);
                     // SAFETY: our CAS won ownership before any notifier could.
                     let waker = unsafe { slot.take_waker() };
-                    slot.state.store(FREE, SeqCst);
+                    slot.state.store(FREE, Release);
                     // Dropping a user waker may re-enter the channel or panic.
                     drop(waker);
                     return;
@@ -324,7 +327,7 @@ impl WaiterList {
                 NOTIFYING => {
                     if slot
                         .state
-                        .compare_exchange(state, token.ticket | CANCELLED, SeqCst, SeqCst)
+                        .compare_exchange(state, token.ticket | CANCELLED, AcqRel, Acquire)
                         .is_err()
                     {
                         continue;
@@ -339,7 +342,7 @@ impl WaiterList {
                 NOTIFIED => {
                     // The waker has been moved out, and only our token can free
                     // this slot. The notifier no longer accesses its payload/state.
-                    slot.state.store(FREE, SeqCst);
+                    slot.state.store(FREE, Release);
                     if forward {
                         self.notify_one(count);
                     }
@@ -355,12 +358,12 @@ impl WaiterList {
         let start = position;
         loop {
             let slot = &position.page.slots[position.slot];
-            let state = slot.state.load(SeqCst);
+            let state = slot.state.load(Acquire);
             let ticket = state & !STATE_MASK;
             if state & STATE_MASK == WAITING
                 && slot
                     .state
-                    .compare_exchange(state, ticket | NOTIFYING, SeqCst, SeqCst)
+                    .compare_exchange(state, ticket | NOTIFYING, AcqRel, Acquire)
                     .is_ok()
             {
                 position.advance(&self.first);
