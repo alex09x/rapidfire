@@ -177,7 +177,8 @@ dropped with the channel.
 - `RUSTFLAGS="--cfg fcrs_small_blocks" cargo test`: three-slot blocks to stress
   transitions, recycling and back-pressure.
 - `cargo test --release --features loom --lib --test loom --test mpsc_loom`: bounded
-  concurrency models, including atomic waiter and pool ownership. Two default wakeup searches cap permutations at 1,000,000;
+  concurrency models, including atomic waiter and pool ownership. Two default
+  wakeup searches cap permutations at 1,000,000;
   `RAPIDFIRE_LOOM_EXTENDED=1` removes that cap, retaining the preemption bounds.
 - `RUSTFLAGS="--cfg fcrs_small_blocks" MIRIFLAGS="-Zmiri-strict-provenance"
   cargo +nightly miri test --lib -- --skip threads_`: unsafe-core checks.
