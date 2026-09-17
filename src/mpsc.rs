@@ -31,6 +31,7 @@
 //! ```
 
 use crate::queue::Backoff;
+use crate::waiters::WaiterToken;
 pub use crate::Sender;
 use crate::{RecvError, RecvState, TryRecvError};
 use std::future::Future;
@@ -176,7 +177,7 @@ impl<T> Receiver<T> {
 /// A pending exclusive receive, created by [`Receiver::recv`].
 pub struct Recv<'a, T> {
     receiver: &'a mut Receiver<T>,
-    waiter_id: Option<u64>,
+    waiter_id: Option<WaiterToken>,
 }
 
 impl<T> Unpin for Recv<'_, T> {}
