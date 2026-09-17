@@ -149,10 +149,18 @@ Bounded MPSC receives retain the atomic read-modify-write needed by the sender
 parking protocol; unbounded receives can publish the new head with a store.
 
 A receive batch publishes freed capacity once per chunk within a block and wakes
-up to the corresponding number of blocked senders. Waiter lists and the recycling
-pool use mutexes; they are not a claim of lock-free progress for every API operation.
-Blocks remain allocated until channel destruction, retaining high-water memory.
-See [queue.rs](src/queue.rs) for the protocol and memory-ordering arguments.
+up to the corresponding number of blocked senders. On this development branch,
+waiters and the recycling pool use atomic ownership slots instead of mutexes.
+Waiter scans rotate through reusable slots; waiter notification order is not a
+FIFO guarantee. A cancellation forwards an absorbed notification even when the
+original notifier is paused. Blocks and extra slot pages remain allocated until
+channel destruction, retaining high-water memory.
+
+Removing internal mutexes does not make every API operation formally lock-free:
+a producer paused after reserving a message or installing a block can still delay
+other operations. Allocation and user-supplied waker callbacks have their own
+progress properties. See [queue.rs](src/queue.rs) and [waiters.rs](src/waiters.rs)
+for the ownership and synchronization protocols.
 
 Pending `Send` and `Recv` futures unregister their waiters on cancellation and
 forward notifications when needed. Version 0.2.0 also fixes a completing operation
@@ -168,8 +176,8 @@ dropped with the channel.
 - `cargo test`: queue, integration and compile-fail documentation tests.
 - `RUSTFLAGS="--cfg fcrs_small_blocks" cargo test`: three-slot blocks to stress
   transitions, recycling and back-pressure.
-- `cargo test --release --features loom --test loom --test mpsc_loom`: 16 bounded
-  concurrency models. Two default wakeup searches cap permutations at 1,000,000;
+- `cargo test --release --features loom --lib --test loom --test mpsc_loom`: bounded
+  concurrency models, including atomic waiter and pool ownership. Two default wakeup searches cap permutations at 1,000,000;
   `RAPIDFIRE_LOOM_EXTENDED=1` removes that cap, retaining the preemption bounds.
 - `RUSTFLAGS="--cfg fcrs_small_blocks" MIRIFLAGS="-Zmiri-strict-provenance"
   cargo +nightly miri test --lib -- --skip threads_`: unsafe-core checks.
