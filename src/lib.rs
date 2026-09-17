@@ -1,6 +1,6 @@
 //! # rapidfire
 //!
-//! An ultra low-latency, lock-free, dependency-free async MPMC channel for Rust.
+//! Async MPMC and MPSC channels with receive batching and no runtime dependencies.
 //!
 //! Designed for high-throughput, latency-critical pipelines (trading bots, WebSocket
 //! fan-in, market-data multiplexers) where message loss is unacceptable and every
@@ -8,9 +8,9 @@
 //!
 //! ## Architecture
 //!
-//! - **Own lock-free block queue, zero dependencies.**  Values live in 63-slot blocks
+//! - **Atomic block queue, zero dependencies.**  Values live in 63-slot blocks
 //!   chained through `prev`/`next` pointers.  Producers claim a slot on the tail index
-//!   (a wait-free `fetch_add` while uncontended, a CAS once contention is observed,
+//!   (`fetch_add` while uncontended, a CAS once contention is observed,
 //!   because with several producers CAS serialises the claims and keeps adjacent-slot
 //!   writes from fighting over one cache line); consumers check the head slot's state
 //!   and claim it with a CAS only once the value is there, so they never touch the
@@ -24,7 +24,7 @@
 //!   block, each block's producer header and consumer header (read marks) and the
 //!   rarely written wake-up flags all live on separate lines.  On the hot path the
 //!   only lines that cross cores are the slot lines carrying the values.
-//! - **Zero-cost sleep and wake, no `SeqCst` on the hot path.**  While messages flow
+//! - **No waiter registration while messages flow.**  While messages flow
 //!   no lock is taken and no waker is cloned.  A producer only does a `Relaxed` load
 //!   of one read-mostly flag right after its claim; the party that goes to sleep pays
 //!   instead, with one RMW on the other side's index that every later claim
@@ -50,17 +50,18 @@
 
 mod queue;
 mod sync;
+mod waiters;
 
 pub mod mpsc;
 
 use crate::queue::{Backoff, Queue};
-use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
-use crate::sync::{Arc, AtomicBool, AtomicU64, AtomicUsize, CachePadded, Mutex, MutexGuard};
-use std::collections::VecDeque;
+use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, SeqCst};
+use crate::sync::{Arc, AtomicBool, AtomicU64, AtomicUsize, CachePadded};
+use crate::waiters::{WaiterList, WaiterToken};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
 // ============================================================================
 // Error Types
@@ -204,141 +205,6 @@ struct Flags {
     next_waiter_id: AtomicU64,
 }
 
-/// A FIFO of parked wakers.  Invariant: while the lock is held, `count` (the
-/// matching `Flags` counter) equals `list.len()`.
-struct WaiterList {
-    list: Mutex<VecDeque<(u64, Waker)>>,
-}
-
-impl WaiterList {
-    fn new() -> Self {
-        WaiterList {
-            list: Mutex::new(VecDeque::with_capacity(4)),
-        }
-    }
-
-    #[inline]
-    fn lock(&self) -> MutexGuard<'_, VecDeque<(u64, Waker)>> {
-        self.list.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Registers (or refreshes) `id`'s waker and bumps `count` if a new entry was added.
-    #[cold]
-    fn register(
-        &self,
-        count: &AtomicUsize,
-        next_id: &AtomicU64,
-        id: &mut Option<u64>,
-        waker: &Waker,
-    ) {
-        let mut list = self.lock();
-        if let Some(my) = *id {
-            if let Some(entry) = list.iter_mut().find(|(entry_id, _)| *entry_id == my) {
-                if !entry.1.will_wake(waker) {
-                    entry.1 = waker.clone();
-                }
-                return;
-            }
-        }
-        let my = match *id {
-            Some(my) => my,
-            None => {
-                let my = next_id.fetch_add(1, Relaxed);
-                *id = Some(my);
-                my
-            }
-        };
-        list.push_back((my, waker.clone()));
-        // Made visible to the other side by the caller's `*_parking` RMW (see queue.rs).
-        count.fetch_add(1, Release);
-    }
-
-    /// Removes `id`'s entry if it is still parked.
-    ///
-    /// If the entry is gone, a notification already popped it: that wake-up was meant
-    /// to make *someone* consume a value (or a freed slot).  A future that is being
-    /// cancelled (`forward == true`) never will, so it passes the wake-up on.
-    /// A poll consumes its previous registration *before* attempting the operation.
-    /// If the register/recheck path succeeds, it also forwards: a notification may
-    /// have arrived after that operation and belong to a later value or free slot.
-    #[cold]
-    fn unregister(&self, count: &AtomicUsize, id: &mut Option<u64>, forward: bool) {
-        if let Some(my) = id.take() {
-            // This future's registration increment happens-before this load. A later
-            // zero count therefore proves its entry was already removed by a notify.
-            // Concurrent registrations cannot restore our entry. Cancellation keeps
-            // the locked path so an absorbed wake-up is still forwarded.
-            if !forward && count.load(Acquire) == 0 {
-                return;
-            }
-            let mut list = self.lock();
-            if let Some(pos) = list.iter().position(|(entry_id, _)| *entry_id == my) {
-                list.remove(pos);
-                count.fetch_sub(1, SeqCst);
-                return;
-            }
-            drop(list);
-            if forward {
-                self.notify_one(count);
-            }
-        }
-    }
-
-    /// Wakes the longest-waiting entry, if any.
-    #[cold]
-    fn notify_one(&self, count: &AtomicUsize) {
-        let waker = {
-            let mut list = self.lock();
-            match list.pop_front() {
-                Some((_, waker)) => {
-                    count.fetch_sub(1, SeqCst);
-                    Some(waker)
-                }
-                None => None,
-            }
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-
-    /// Wakes every entry.
-    #[cold]
-    fn notify_all(&self, count: &AtomicUsize) {
-        let wakers: Vec<Waker> = {
-            let mut list = self.lock();
-            count.store(0, SeqCst);
-            list.drain(..).map(|(_, waker)| waker).collect()
-        };
-        for waker in wakers {
-            waker.wake();
-        }
-    }
-
-    /// Wakes up to `limit` senders after an exclusive receive batch frees slots.
-    #[cold]
-    fn notify_many(&self, count: &AtomicUsize, limit: usize) {
-        if limit == 1 {
-            self.notify_one(count);
-            return;
-        }
-        let wakers: Vec<Waker> = {
-            let mut list = self.lock();
-            let n = limit.min(list.len());
-            // Allocate before removing entries or decrementing their count.
-            let mut wakers = Vec::with_capacity(n);
-            for _ in 0..n {
-                wakers.push(list.pop_front().unwrap().1);
-            }
-            count.fetch_sub(n, SeqCst);
-            wakers
-        };
-        for waker in wakers {
-            waker.wake();
-        }
-    }
-}
-
 struct Inner<T> {
     queue: Queue<T>,
     flags: CachePadded<Flags>,
@@ -471,7 +337,7 @@ pub struct Receiver<T> {
 }
 
 // SAFETY: `Inner<T>` is `Send + Sync` for `T: Send` (the queue hands values across
-// threads with proper synchronisation; everything else is atomics and mutexes).
+// threads with proper synchronisation; waiter payloads have atomic ownership).
 unsafe impl<T: std::marker::Send> std::marker::Send for Sender<T> {}
 unsafe impl<T: std::marker::Send> Sync for Sender<T> {}
 unsafe impl<T: std::marker::Send> std::marker::Send for Receiver<T> {}
@@ -718,7 +584,7 @@ impl<T> Receiver<T> {
 pub struct Send<'a, T> {
     sender: &'a Sender<T>,
     msg: Option<T>,
-    waiter_id: Option<u64>,
+    waiter_id: Option<WaiterToken>,
 }
 
 impl<T> Send<'_, T> {
@@ -800,7 +666,7 @@ impl<T> Future for Send<'_, T> {
 /// Future returned by [`Receiver::recv`].
 pub struct Recv<'a, T> {
     receiver: &'a Receiver<T>,
-    waiter_id: Option<u64>,
+    waiter_id: Option<WaiterToken>,
 }
 
 impl<T> Recv<'_, T> {
