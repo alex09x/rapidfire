@@ -41,9 +41,6 @@ struct Slot {
 // successful WAITING -> NOTIFYING notification accesses the payload. Publishing
 // WAITING transfers the initialized waker; FREE is published only after removal.
 // Cancellation of NOTIFYING changes only the atomic state, not the payload.
-// Release publishes initialized or vacated payload storage; every successful
-// claimant acquires it. Close/registration visibility additionally uses the
-// separate closing RMW. Ownership RMWs retain the stronger SeqCst ordering.
 unsafe impl Sync for Slot {}
 
 impl Slot {
@@ -181,7 +178,7 @@ impl Notification<'_> {
         if old & STATE_MASK == CANCELLED {
             // The token was surrendered to us. No other operation can free this
             // slot until we do, so it cannot yet have been reused.
-            self.slot.state.store(FREE, Release);
+            self.slot.state.store(FREE, SeqCst);
         }
         // When old was NOTIFYING, the token owner may already have freed/reused
         // the slot. Never touch it again. User code runs outside slot ownership.
@@ -259,7 +256,7 @@ impl WaiterList {
                     });
                     // Count first: a notifier cannot decrement before this increment.
                     count.fetch_add(1, SeqCst);
-                    slot.state.store(ticket | WAITING, Release);
+                    slot.state.store(ticket | WAITING, SeqCst);
                     // Paired with close's RMW: an earlier close becomes visible
                     // to the caller's recheck, a later close sees this slot/page.
                     self.closing.fetch_or(false, AcqRel);
@@ -319,7 +316,7 @@ impl WaiterList {
                     count.fetch_sub(1, SeqCst);
                     // SAFETY: our CAS won ownership before any notifier could.
                     let waker = unsafe { slot.take_waker() };
-                    slot.state.store(FREE, Release);
+                    slot.state.store(FREE, SeqCst);
                     // Dropping a user waker may re-enter the channel or panic.
                     drop(waker);
                     return;
@@ -342,7 +339,7 @@ impl WaiterList {
                 NOTIFIED => {
                     // The waker has been moved out, and only our token can free
                     // this slot. The notifier no longer accesses its payload/state.
-                    slot.state.store(FREE, Release);
+                    slot.state.store(FREE, SeqCst);
                     if forward {
                         self.notify_one(count);
                     }
