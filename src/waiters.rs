@@ -553,6 +553,8 @@ mod tests {
     #[test]
     fn list_drop_releases_forgotten_wakers_exactly_once() {
         struct Tracked(Arc<Count>);
+        // The observable action is the custom Drop invoked when wake consumes Arc.
+        #[allow(clippy::manual_noop_waker)]
         impl Wake for Tracked {
             fn wake(self: Arc<Self>) {}
         }
@@ -584,6 +586,8 @@ mod tests {
             next: Arc<AtomicU64>,
             calls: Arc<Count>,
         }
+        // Drop re-enters the list; Waker::noop cannot exercise this ownership path.
+        #[allow(clippy::manual_noop_waker)]
         impl Wake for Reenter {
             fn wake(self: Arc<Self>) {}
         }
