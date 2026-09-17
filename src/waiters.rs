@@ -41,9 +41,9 @@ struct Slot {
 // successful WAITING -> NOTIFYING notification accesses the payload. Publishing
 // WAITING transfers the initialized waker; FREE is published only after removal.
 // Cancellation of NOTIFYING changes only the atomic state, not the payload.
-// Release publishes each payload transition; the next successful owner acquires
-// it. Close/registration ordering is carried by the separate closing RMW, not
-// by a global sequentially consistent order on slots or page links.
+// Release publishes initialized or vacated payload storage; every successful
+// claimant acquires it. Close/registration visibility additionally uses the
+// separate closing RMW. Ownership RMWs retain the stronger SeqCst ordering.
 unsafe impl Sync for Slot {}
 
 impl Slot {
@@ -90,7 +90,7 @@ impl Page {
     }
 
     fn next(&self) -> Option<&Page> {
-        let next = self.next.load(Acquire);
+        let next = self.next.load(SeqCst);
         // SAFETY: published pages remain allocated until exclusive list Drop.
         unsafe { next.as_ref() }
     }
@@ -102,7 +102,7 @@ impl Page {
         let new = Box::into_raw(Box::new(Page::new(self.index + 1)));
         let next = match self
             .next
-            .compare_exchange(ptr::null_mut(), new, AcqRel, Acquire)
+            .compare_exchange(ptr::null_mut(), new, SeqCst, SeqCst)
         {
             Ok(_) => new,
             Err(existing) => {
@@ -176,7 +176,7 @@ impl Notification<'_> {
         // SAFETY: the successful WAITING -> NOTIFYING CAS transferred the waker
         // to this notifier. A racing cancellation cannot read or drop it.
         let waker = unsafe { self.slot.take_waker() };
-        let old = self.slot.state.swap(self.ticket | NOTIFIED, AcqRel);
+        let old = self.slot.state.swap(self.ticket | NOTIFIED, SeqCst);
         debug_assert!(old == (self.ticket | NOTIFYING) || old == (self.ticket | CANCELLED));
         if old & STATE_MASK == CANCELLED {
             // The token was surrendered to us. No other operation can free this
@@ -248,7 +248,7 @@ impl WaiterList {
                 if slot.state.load(Relaxed) == FREE
                     && slot
                         .state
-                        .compare_exchange(FREE, ticket | WRITING, AcqRel, Acquire)
+                        .compare_exchange(FREE, ticket | WRITING, SeqCst, SeqCst)
                         .is_ok()
                 {
                     position.advance(&self.first);
@@ -305,13 +305,13 @@ impl WaiterList {
         let Some(token) = token.take() else { return };
         let slot = self.slot(&token);
         loop {
-            let state = slot.state.load(Acquire);
+            let state = slot.state.load(SeqCst);
             debug_assert_eq!(state & !STATE_MASK, token.ticket);
             match state & STATE_MASK {
                 WAITING => {
                     if slot
                         .state
-                        .compare_exchange(state, token.ticket | WRITING, AcqRel, Acquire)
+                        .compare_exchange(state, token.ticket | WRITING, SeqCst, SeqCst)
                         .is_err()
                     {
                         continue;
@@ -327,7 +327,7 @@ impl WaiterList {
                 NOTIFYING => {
                     if slot
                         .state
-                        .compare_exchange(state, token.ticket | CANCELLED, AcqRel, Acquire)
+                        .compare_exchange(state, token.ticket | CANCELLED, SeqCst, SeqCst)
                         .is_err()
                     {
                         continue;
@@ -358,12 +358,12 @@ impl WaiterList {
         let start = position;
         loop {
             let slot = &position.page.slots[position.slot];
-            let state = slot.state.load(Acquire);
+            let state = slot.state.load(SeqCst);
             let ticket = state & !STATE_MASK;
             if state & STATE_MASK == WAITING
                 && slot
                     .state
-                    .compare_exchange(state, ticket | NOTIFYING, AcqRel, Acquire)
+                    .compare_exchange(state, ticket | NOTIFYING, SeqCst, SeqCst)
                     .is_ok()
             {
                 position.advance(&self.first);
