@@ -7,7 +7,7 @@ description = "Zero-dependency async MPMC and MPSC channels with atomic synchron
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alex09x/rapidfire"
 readme = "README.md"
-keywords = ["channel", "async", "lock-free", "latency", "tokio"]
+keywords = ["channel", "async", "mpsc", "latency", "tokio"]
 categories = ["concurrency", "asynchronous"]
 
 [dependencies]
