@@ -149,8 +149,8 @@ Bounded MPSC receives retain the atomic read-modify-write needed by the sender
 parking protocol; unbounded receives can publish the new head with a store.
 
 A receive batch publishes freed capacity once per chunk within a block and wakes
-up to the corresponding number of blocked senders. On this development branch,
-waiters and the recycling pool use atomic ownership slots instead of mutexes.
+up to the corresponding number of blocked senders. Waiters and the recycling
+pool use atomic ownership slots instead of mutexes.
 Waiter scans rotate through reusable slots; waiter notification order is not a
 FIFO guarantee. A cancellation forwards an absorbed notification even when the
 original notifier is paused. Blocks and extra slot pages remain allocated until
