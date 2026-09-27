@@ -176,6 +176,10 @@ dropped with the channel.
 - GitHub Actions runs native tests on Linux x86-64, Linux ARM64 and macOS, with
   separate Loom and Miri jobs on Linux. Hosted-runner benchmark numbers are indicative.
 
+## Author
+
+[Alexander Panasenko](https://prod.codes/about/) ([@alex09x](https://github.com/alex09x))
+
 ## License
 
 Licensed under either [Apache License, Version 2.0](LICENSE-APACHE) or
