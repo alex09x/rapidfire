@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Replace the waiter-list and block-pool mutexes with reusable atomic ownership
+  slots. Retain overflow pages until channel destruction; cancellation forwards
+  notifications without waiting for a notifier to resume.
+- Rotate waiter selection and registration scans. Notification order between
+  parked tasks is not guaranteed to be FIFO; message ordering is unchanged.
+- Check slot reuse, cancellation, concurrent pool access and page growth with
+  focused native, Loom and Miri tests. Document remaining progress limitations.
+
 ## 0.2.0
 
 - Add `mpsc::bounded` and `mpsc::unbounded` for many producers and exactly one

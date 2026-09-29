@@ -12,7 +12,7 @@ mod loom_impl {
     pub(crate) use loom::sync::atomic::{
         AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering,
     };
-    pub(crate) use loom::sync::{Arc, Mutex, MutexGuard};
+    pub(crate) use loom::sync::Arc;
     pub(crate) use loom::thread::yield_now;
 
     #[inline(always)]
@@ -27,7 +27,7 @@ mod std_impl {
     pub(crate) use std::sync::atomic::{
         AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering,
     };
-    pub(crate) use std::sync::{Arc, Mutex, MutexGuard};
+    pub(crate) use std::sync::Arc;
     pub(crate) use std::thread::yield_now;
 
     /// `std::cell::UnsafeCell` with loom's closure-based accessor API.
