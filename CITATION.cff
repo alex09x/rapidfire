@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the software and the specific version archive."
+type: software
+title: "rapidfire: Lock-free asynchronous MPMC channel for Rust"
+authors:
+  - family-names: Panasenko
+    given-names: Alexander
+    orcid: "https://orcid.org/0009-0003-3569-6490"
+    email: alex@prod.codes
+repository-code: "https://github.com/alex09x/rapidfire"
+license: Apache-2.0
+doi: 10.5281/zenodo.23028433
+preferred-citation:
+  type: software
+  title: "rapidfire: Lock-free asynchronous MPMC channel for Rust"
+  authors:
+    - family-names: Panasenko
+      given-names: Alexander
+      orcid: "https://orcid.org/0009-0003-3569-6490"
+      email: alex@prod.codes
+  version: 0.2.0
+  date-released: "2026-09-16"
+  doi: 10.5281/zenodo.23028434
+  license: Apache-2.0
+  repository-code: "https://github.com/alex09x/rapidfire"

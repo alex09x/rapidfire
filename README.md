@@ -180,6 +180,23 @@ dropped with the channel.
 
 [Alexander Panasenko](https://prod.codes/about/) ([@alex09x](https://github.com/alex09x))
 
+## Citation
+
+If you use `rapidfire` in your research or software, please cite the archived version 0.2.0 release ([DOI: 10.5281/zenodo.23028434](https://doi.org/10.5281/zenodo.23028434)):
+
+```bibtex
+@software{panasenko_2026_23028434,
+  author       = {Panasenko, Alexander},
+  title        = {rapidfire: Lock-free asynchronous MPMC channel for Rust},
+  month        = sep,
+  year         = 2026,
+  publisher    = {Zenodo},
+  version      = {0.2.0},
+  doi          = {10.5281/zenodo.23028434},
+  url          = {https://doi.org/10.5281/zenodo.23028434}
+}
+```
+
 ## License
 
 Licensed under either [Apache License, Version 2.0](LICENSE-APACHE) or
